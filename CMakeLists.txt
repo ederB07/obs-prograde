@@ -19,6 +19,11 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(obsptz)
 
+# PTZ Controls' shared properties-view CMake uses ${CMAKE_SOURCE_DIR}/shared/qt/...
+# because upstream normally builds at repository root. Mirror its shared tree here
+# so those native widgets resolve unchanged when embedded in our OBS template.
+file(COPY "${obsptz_SOURCE_DIR}/shared" DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}")
+
 # Patch only PTZVisca::set() at configure time so the already-existing VISCA
 # exposure commands can be reached through the PTZ device proc-handler.
 file(READ "${obsptz_SOURCE_DIR}/src/ptz-visca.cpp" PTZ_VISCA_SOURCE)
