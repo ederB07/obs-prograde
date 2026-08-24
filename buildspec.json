@@ -33,11 +33,11 @@
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.prolens.obs-prograde"
+            "bundleId": "com.prolens.obs-ptz-control"
         }
     },
-    "name": "obs-prograde",
-    "displayName": "OBS ProGrade",
+    "name": "obs-prolens-ptz",
+    "displayName": "Prolens PTZ Control",
     "version": "0.1.0",
     "author": "Prolens",
     "website": "https://github.com/ederB07/obs-prograde",
