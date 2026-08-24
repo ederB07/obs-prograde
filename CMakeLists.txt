@@ -153,7 +153,7 @@ target_sources(
     "${obsptz_SOURCE_DIR}/src/ptz-usb-cam.hpp"
 )
 
-add_compile_definitions(PLUGIN_NAME="obs-prolens-ptz" PLUGIN_VERSION="0.2.0" ENABLE_ONVIF ENABLE_USB_CAM)
+target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE ENABLE_ONVIF ENABLE_USB_CAM)
 target_compile_features(${CMAKE_PROJECT_NAME} PRIVATE cxx_std_17)
 set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON)
 
