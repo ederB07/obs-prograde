@@ -8,7 +8,6 @@ include(compilerconfig)
 include(defaults)
 include(helpers)
 
-# Pull the real PTZ Controls code and build our UI enhancements on top of it.
 FetchContent_Declare(
   obsptz
   GIT_REPOSITORY https://github.com/glikely/obs-ptz.git
@@ -19,13 +18,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(obsptz)
 
-# PTZ Controls' shared properties-view CMake uses ${CMAKE_SOURCE_DIR}/shared/qt/...
-# because upstream normally builds at repository root. Mirror its shared tree here
-# so those native widgets resolve unchanged when embedded in our OBS template.
 file(COPY "${obsptz_SOURCE_DIR}/shared" DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}")
 
-# Patch only PTZVisca::set() at configure time so the already-existing VISCA
-# exposure commands can be reached through the PTZ device proc-handler.
 file(READ "${obsptz_SOURCE_DIR}/src/ptz-visca.cpp" PTZ_VISCA_SOURCE)
 set(_old_set [=[
 void PTZVisca::set(calldata_t *cd)
@@ -108,7 +102,6 @@ string(REPLACE "${_old_set}" "${_new_set}" PTZ_VISCA_SOURCE "${PTZ_VISCA_SOURCE}
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/patched")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/patched/ptz-visca.cpp" "${PTZ_VISCA_SOURCE}")
 
-# Keep the original locale and data files so this remains PTZ Controls under the hood.
 file(COPY "${obsptz_SOURCE_DIR}/data" DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}")
 
 add_library(${CMAKE_PROJECT_NAME} MODULE)
@@ -141,6 +134,7 @@ target_sources(
     "${obsptz_SOURCE_DIR}/src/ptz-preset-model.cpp"
     "${obsptz_SOURCE_DIR}/src/settings.cpp"
     "${CMAKE_CURRENT_BINARY_DIR}/patched/ptz-visca.cpp"
+    "${obsptz_SOURCE_DIR}/src/ptz-visca.hpp"
     "${obsptz_SOURCE_DIR}/src/ptz-visca-udp.cpp"
     "${obsptz_SOURCE_DIR}/src/ptz-visca-tcp.cpp"
     "${obsptz_SOURCE_DIR}/src/protocol-helpers.cpp"
