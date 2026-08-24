@@ -27,19 +27,19 @@
                 "windows-x64": "0e76bf0555dd5382838850b748d3dcfab44a1e1058441309ab54e1a65b156d0a"
             },
             "debugSymbols": {
-                "windows-x64": "11b7be92cf66a273299b8f3515c07a5cfb61614b59a4e67f7fc5ecba5e2bdf21"
+                "windows-x64": "11b7be92cf66a273299b4e67f7fc5ecba5e2bdf21"
             }
         }
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.example.plugintemplate-for-obs"
+            "bundleId": "com.prolens.obs-prograde"
         }
     },
-    "name": "plugintemplate-for-obs",
-    "displayName": "Plugin Template for OBS",
-    "version": "1.0.0",
-    "author": "Your Name Here",
-    "website": "https://example.com",
-    "email": "me@example.com"
+    "name": "obs-prograde",
+    "displayName": "OBS ProGrade",
+    "version": "0.1.0",
+    "author": "Prolens",
+    "website": "https://github.com/ederB07/obs-prograde",
+    "email": ""
 }
