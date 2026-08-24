@@ -1,633 +1,301 @@
 #include <obs-module.h>
 #include <obs-frontend-api.h>
-#include <graphics/vec3.h>
 
-#include <QApplication>
-#include <QColor>
-#include <QDialog>
-#include <QFileDialog>
+#include <QComboBox>
+#include <QDial>
+#include <QDir>
+#include <QFileInfo>
+#include <QFormLayout>
 #include <QGridLayout>
-#include <QHBoxLayout>
+#include <QGroupBox>
+#include <QHostAddress>
+#include <QIcon>
+#include <QImage>
 #include <QLabel>
 #include <QLineEdit>
-#include <QMouseEvent>
-#include <QPainter>
+#include <QPixmap>
 #include <QPushButton>
+#include <QSettings>
 #include <QSlider>
+#include <QSpinBox>
+#include <QTimer>
+#include <QToolButton>
+#include <QUdpSocket>
 #include <QVBoxLayout>
 #include <QWidget>
 
-#include <algorithm>
-#include <cmath>
+#include <array>
+#include <cstdint>
 #include <functional>
-#include <string>
 
 OBS_DECLARE_MODULE()
-OBS_MODULE_USE_DEFAULT_LOCALE("obs-prograde", "en-US")
+OBS_MODULE_USE_DEFAULT_LOCALE("obs-prolens-ptz", "en-US")
+
 MODULE_EXPORT const char *obs_module_description(void)
 {
-    return "ProGrade: native GPU color grading with four wheels and dual LUT";
+    return "Prolens PTZ Control: VISCA-over-IP dock with focus, exposure, tracking and visual presets";
 }
 
-static const char *FILTER_ID = "prograde_filter";
+static constexpr const char *DOCK_ID = "prolens_ptz_control";
+static constexpr int PRESET_COUNT = 8;
 
-struct ProGradeFilter {
-    obs_source_t *context = nullptr;
-    obs_source_t *parent = nullptr;
-    obs_source_t *lut1 = nullptr;
-    obs_source_t *lut2 = nullptr;
-    gs_effect_t *effect = nullptr;
-
-    gs_eparam_t *pLift = nullptr;
-    gs_eparam_t *pLiftLuma = nullptr;
-    gs_eparam_t *pGamma = nullptr;
-    gs_eparam_t *pGammaLuma = nullptr;
-    gs_eparam_t *pGain = nullptr;
-    gs_eparam_t *pGainLuma = nullptr;
-    gs_eparam_t *pOffset = nullptr;
-    gs_eparam_t *pOffsetLuma = nullptr;
-    gs_eparam_t *pSaturation = nullptr;
-
-    QColor lift = QColor(128, 128, 128);
-    QColor gamma = QColor(128, 128, 128);
-    QColor gain = QColor(128, 128, 128);
-    QColor offset = QColor(128, 128, 128);
-    double liftLuma = 0.0;
-    double gammaLuma = 0.0;
-    double gainLuma = 0.0;
-    double offsetLuma = 0.0;
-    double saturation = 1.0;
-    std::string lut1Path;
-    std::string lut2Path;
-    double lut1Mix = 1.0;
-    double lut2Mix = 1.0;
-};
-
-static const char *effect_text = R"(
-uniform float4x4 ViewProj;
-uniform texture2d image;
-uniform float3 lift_color;
-uniform float lift_luma;
-uniform float3 gamma_color;
-uniform float gamma_luma;
-uniform float3 gain_color;
-uniform float gain_luma;
-uniform float3 offset_color;
-uniform float offset_luma;
-uniform float saturation;
-
-sampler_state textureSampler {
-    Filter = Linear;
-    AddressU = Clamp;
-    AddressV = Clamp;
-};
-
-struct VertData {
-    float4 pos : POSITION;
-    float2 uv : TEXCOORD0;
-};
-
-VertData VSDefault(VertData v_in)
+static QString configDir()
 {
-    VertData vert_out;
-    vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
-    vert_out.uv = v_in.uv;
-    return vert_out;
+    char *p = obs_module_config_path("");
+    QString out = p ? QString::fromUtf8(p) : QString();
+    bfree(p);
+    QDir().mkpath(out);
+    return out;
 }
 
-float3 sat_adjust(float3 c, float sat)
+static QByteArray parseHex(QString text)
 {
-    float y = dot(c, float3(0.2126, 0.7152, 0.0722));
-    return lerp(float3(y, y, y), c, sat);
+    text.remove(' ');
+    text.remove(':');
+    text.remove('-');
+    text.replace("0x", "", Qt::CaseInsensitive);
+    if (text.size() % 2)
+        return {};
+    return QByteArray::fromHex(text.toLatin1());
 }
 
-float4 PSProGrade(VertData v_in) : TARGET
-{
-    float4 px = image.Sample(textureSampler, v_in.uv);
-    float3 c = px.rgb;
-    float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
-
-    float shadow = 1.0 - smoothstep(0.12, 0.58, lum);
-    float high = smoothstep(0.42, 0.92, lum);
-    float mid = saturate(1.0 - abs(lum - 0.5) * 2.15);
-    mid = smoothstep(0.0, 1.0, mid);
-
-    c += offset_luma * 0.32;
-    c += offset_color * 0.32;
-
-    c += shadow * lift_luma * 0.28;
-    c += shadow * lift_color * 0.32;
-
-    float g = exp(-gamma_luma * 1.25);
-    float3 gc = pow(max(c, 0.00001), float3(g, g, g));
-    c = lerp(c, gc, mid);
-    c += mid * gamma_color * 0.26;
-
-    c *= 1.0 + high * gain_luma * 0.65;
-    c += high * gain_color * 0.30;
-
-    c = sat_adjust(c, saturation);
-    return float4(max(c, 0.0), px.a);
-}
-
-technique Draw
-{
-    pass
-    {
-        vertex_shader = VSDefault(v_in);
-        pixel_shader = PSProGrade(v_in);
-    }
-}
-)";
-
-static QColor color_from_obs(obs_data_t *settings, const char *key)
-{
-    uint32_t c = (uint32_t)obs_data_get_int(settings, key);
-    return QColor((int)(c & 0xff), (int)((c >> 8) & 0xff), (int)((c >> 16) & 0xff));
-}
-
-static uint32_t color_to_obs(const QColor &c)
-{
-    return (uint32_t)c.red() | ((uint32_t)c.green() << 8) | ((uint32_t)c.blue() << 16);
-}
-
-static void set_bias(gs_eparam_t *param, const QColor &c)
-{
-    float r = c.redF();
-    float g = c.greenF();
-    float b = c.blueF();
-    float avg = (r + g + b) / 3.0f;
-    vec3 v;
-    vec3_set(&v, r - avg, g - avg, b - avg);
-    gs_effect_set_vec3(param, &v);
-}
-
-static void update_lut_filter(obs_source_t *lut, const std::string &path, double mix)
-{
-    if (!lut)
-        return;
-    obs_data_t *s = obs_source_get_settings(lut);
-    obs_data_set_string(s, "image_path", path.c_str());
-    obs_data_set_double(s, "clut_amount", mix);
-    obs_source_update(lut, s);
-    obs_data_release(s);
-}
-
-static void ensure_luts(ProGradeFilter *f)
-{
-    if (!f || !f->parent)
-        return;
-
-    if (!f->lut1) {
-        obs_data_t *s = obs_data_create();
-        f->lut1 = obs_source_create_private("clut_filter", "[ProGrade] LUT 1", s);
-        obs_data_release(s);
-        if (f->lut1)
-            obs_source_filter_add(f->parent, f->lut1);
-    }
-    if (!f->lut2) {
-        obs_data_t *s = obs_data_create();
-        f->lut2 = obs_source_create_private("clut_filter", "[ProGrade] LUT 2", s);
-        obs_data_release(s);
-        if (f->lut2)
-            obs_source_filter_add(f->parent, f->lut2);
-    }
-
-    update_lut_filter(f->lut1, f->lut1Path, f->lut1Mix);
-    update_lut_filter(f->lut2, f->lut2Path, f->lut2Mix);
-
-    if (f->lut1)
-        obs_source_filter_set_order(f->parent, f->lut1, OBS_ORDER_MOVE_BOTTOM);
-    if (f->lut2)
-        obs_source_filter_set_order(f->parent, f->lut2, OBS_ORDER_MOVE_BOTTOM);
-}
-
-class ColorWheel : public QWidget {
+class ViscaClient : public QObject {
 public:
-    QColor value = QColor(128, 128, 128);
-    std::function<void(const QColor &)> changed;
+    explicit ViscaClient(QObject *parent = nullptr) : QObject(parent) {}
+    QString host = "192.168.1.100";
+    quint16 port = 52381;
+    quint32 sequence = 1;
 
-    explicit ColorWheel(QWidget *parent = nullptr) : QWidget(parent)
+    void sendPayload(const QByteArray &payload)
     {
-        setMinimumSize(180, 180);
-        setMaximumSize(220, 220);
+        if (payload.isEmpty()) return;
+        QByteArray packet;
+        packet.reserve(payload.size() + 8);
+        packet.append(char(0x01)); packet.append(char(0x00));
+        packet.append(char((payload.size() >> 8) & 0xff)); packet.append(char(payload.size() & 0xff));
+        packet.append(char((sequence >> 24) & 0xff)); packet.append(char((sequence >> 16) & 0xff));
+        packet.append(char((sequence >> 8) & 0xff)); packet.append(char(sequence & 0xff));
+        packet.append(payload);
+        ++sequence;
+        socket.writeDatagram(packet, QHostAddress(host), port);
+    }
+    void sendHex(const QString &hex) { sendPayload(parseHex(hex)); }
+
+    void panTilt(int panDir, int tiltDir, int panSpeed = 8, int tiltSpeed = 8)
+    {
+        QByteArray p;
+        p.append(char(0x81)); p.append(char(0x01)); p.append(char(0x06)); p.append(char(0x01));
+        p.append(char(qBound(1, panSpeed, 24))); p.append(char(qBound(1, tiltSpeed, 20)));
+        p.append(char(panDir)); p.append(char(tiltDir)); p.append(char(0xff));
+        sendPayload(p);
+    }
+    void stopPT() { panTilt(0x03, 0x03); }
+    void zoomStop() { sendPayload(QByteArray::fromHex("8101040700ff")); }
+    void zoomTele(int speed = 4) { sendPayload(QByteArray::fromHex("81010407") + QByteArray(1, char(0x20 | qBound(0, speed, 7))) + QByteArray(1, char(0xff))); }
+    void zoomWide(int speed = 4) { sendPayload(QByteArray::fromHex("81010407") + QByteArray(1, char(0x30 | qBound(0, speed, 7))) + QByteArray(1, char(0xff))); }
+    void focusStop() { sendPayload(QByteArray::fromHex("8101040800ff")); }
+    void focusFar() { sendPayload(QByteArray::fromHex("8101040802ff")); }
+    void focusNear() { sendPayload(QByteArray::fromHex("8101040803ff")); }
+    void focusAuto(bool on) { sendPayload(on ? QByteArray::fromHex("8101043802ff") : QByteArray::fromHex("8101043803ff")); }
+    void exposureAuto(bool on) { sendPayload(on ? QByteArray::fromHex("8101043900ff") : QByteArray::fromHex("8101043903ff")); }
+    void irisStep(bool up) { sendPayload(up ? QByteArray::fromHex("8101040b02ff") : QByteArray::fromHex("8101040b03ff")); }
+    void shutterStep(bool up) { sendPayload(up ? QByteArray::fromHex("8101040a02ff") : QByteArray::fromHex("8101040a03ff")); }
+    void gainStep(bool up) { sendPayload(up ? QByteArray::fromHex("8101040c02ff") : QByteArray::fromHex("8101040c03ff")); }
+    void presetSet(int preset) { QByteArray p = QByteArray::fromHex("8101043f01"); p.append(char(qBound(0, preset, 255))); p.append(char(0xff)); sendPayload(p); }
+    void presetRecall(int preset) { QByteArray p = QByteArray::fromHex("8101043f02"); p.append(char(qBound(0, preset, 255))); p.append(char(0xff)); sendPayload(p); }
+private:
+    QUdpSocket socket;
+};
+
+class HoldButton : public QPushButton {
+public:
+    std::function<void()> pressedAction;
+    std::function<void()> releasedAction;
+    explicit HoldButton(const QString &text, QWidget *parent = nullptr) : QPushButton(text, parent)
+    {
+        connect(this, &QPushButton::pressed, this, [this] { if (pressedAction) pressedAction(); });
+        connect(this, &QPushButton::released, this, [this] { if (releasedAction) releasedAction(); });
+    }
+};
+
+class FocusWheel : public QDial {
+public:
+    std::function<void(int)> jog;
+    explicit FocusWheel(QWidget *parent = nullptr) : QDial(parent)
+    {
+        setRange(-100, 100); setValue(0); setNotchesVisible(true); setMinimumSize(94, 94);
+        connect(this, &QDial::sliderMoved, this, [this](int v) { if (jog && qAbs(v) > 6) jog(v); });
+        connect(this, &QDial::sliderReleased, this, [this] { setValue(0); });
+    }
+};
+
+class ProlensPtzDock : public QWidget {
+public:
+    explicit ProlensPtzDock(QWidget *parent = nullptr) : QWidget(parent)
+    {
+        settings = new QSettings(configDir() + "/prolens-ptz.ini", QSettings::IniFormat, this);
+        buildUi(); loadSettings(); refreshSources();
     }
 
-protected:
-    void paintEvent(QPaintEvent *) override
+    void screenshotReady()
     {
-        QPainter p(this);
-        p.setRenderHint(QPainter::Antialiasing, true);
-        const int side = std::min(width(), height()) - 12;
-        QRectF rect((width() - side) / 2.0, (height() - side) / 2.0, side, side);
-        const QPointF c = rect.center();
-        const double radius = rect.width() / 2.0;
-
-        QImage wheel((int)rect.width(), (int)rect.height(), QImage::Format_ARGB32_Premultiplied);
-        wheel.fill(Qt::transparent);
-        for (int y = 0; y < wheel.height(); ++y) {
-            for (int x = 0; x < wheel.width(); ++x) {
-                double dx = x - wheel.width() / 2.0;
-                double dy = y - wheel.height() / 2.0;
-                double rr = std::sqrt(dx * dx + dy * dy) / radius;
-                if (rr <= 1.0) {
-                    double ang = std::atan2(-dy, dx);
-                    double hue = std::fmod(ang / (2.0 * M_PI) + 1.0, 1.0);
-                    QColor col;
-                    col.setHsvF(hue, std::min(1.0, rr), 0.94);
-                    wheel.setPixelColor(x, y, col);
-                }
-            }
-        }
-        p.drawImage(rect.topLeft(), wheel);
-        p.setPen(QPen(QColor(95, 95, 102), 2));
-        p.drawEllipse(rect);
-
-        QColor hsv = value.toHsv();
-        double hue = hsv.hsvHueF();
-        if (hue < 0.0)
-            hue = 0.0;
-        double sat = hsv.hsvSaturationF();
-        double ang = hue * 2.0 * M_PI;
-        QPointF marker(c.x() + std::cos(ang) * sat * radius,
-                       c.y() - std::sin(ang) * sat * radius);
-        p.setBrush(Qt::white);
-        p.setPen(QPen(Qt::black, 2));
-        p.drawEllipse(marker, 6, 6);
-    }
-
-    void mousePressEvent(QMouseEvent *e) override { setFromPoint(e->position()); }
-    void mouseMoveEvent(QMouseEvent *e) override
-    {
-        if (e->buttons() & Qt::LeftButton)
-            setFromPoint(e->position());
+        if (pendingPreset < 0) return;
+        char *p = obs_frontend_get_last_screenshot();
+        if (!p) return;
+        QString src = QString::fromUtf8(p); bfree(p);
+        QImage img(src);
+        if (img.isNull()) return;
+        img = img.scaled(320, 180, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+        QString dst = configDir() + QString("/preset-%1.jpg").arg(pendingPreset);
+        img.save(dst, "JPG", 88);
+        presetImages[pendingPreset] = dst;
+        updatePresetButton(pendingPreset);
+        settings->setValue(QString("preset/%1/image").arg(pendingPreset), dst);
+        pendingPreset = -1;
     }
 
 private:
-    void setFromPoint(const QPointF &pt)
+    ViscaClient client;
+    QSettings *settings = nullptr;
+    QLineEdit *ipEdit = nullptr;
+    QSpinBox *portSpin = nullptr;
+    QComboBox *sourceCombo = nullptr;
+    QComboBox *exposureMode = nullptr;
+    QToolButton *tracking = nullptr;
+    QLineEdit *trackOnHex = nullptr;
+    QLineEdit *trackOffHex = nullptr;
+    QSlider *speedSlider = nullptr;
+    QSlider *zoomSpeedSlider = nullptr;
+    QLabel *status = nullptr;
+    std::array<QToolButton *, PRESET_COUNT> presetButtons{};
+    std::array<QString, PRESET_COUNT> presetImages{};
+    int pendingPreset = -1;
+
+    int ptSpeed() const { return speedSlider ? speedSlider->value() : 8; }
+    int zoomSpeed() const { return zoomSpeedSlider ? zoomSpeedSlider->value() : 4; }
+
+    QPushButton *button(const QString &text, std::function<void()> fn)
     {
-        const int side = std::min(width(), height()) - 12;
-        QPointF c(width() / 2.0, height() / 2.0);
-        double radius = side / 2.0;
-        double dx = pt.x() - c.x();
-        double dy = c.y() - pt.y();
-        double rr = std::min(1.0, std::sqrt(dx * dx + dy * dy) / radius);
-        double ang = std::atan2(dy, dx);
-        double hue = std::fmod(ang / (2.0 * M_PI) + 1.0, 1.0);
-        QColor col;
-        col.setHsvF(hue, rr, 0.5);
-        value = col;
-        update();
-        if (changed)
-            changed(value);
+        auto *b = new QPushButton(text);
+        connect(b, &QPushButton::clicked, this, [fn] { fn(); });
+        return b;
+    }
+    HoldButton *hold(const QString &text, std::function<void()> start, std::function<void()> stop)
+    {
+        auto *b = new HoldButton(text); b->pressedAction = std::move(start); b->releasedAction = std::move(stop); return b;
+    }
+
+    void buildUi()
+    {
+        setMinimumWidth(390);
+        setStyleSheet("QWidget{font-size:12px;}QGroupBox{font-weight:600;border:1px solid rgba(128,31,221,90);border-radius:8px;margin-top:8px;padding-top:8px;}QGroupBox::title{subcontrol-origin:margin;left:10px;padding:0 5px;}QPushButton,QToolButton{min-height:30px;border-radius:6px;padding:4px 8px;}QToolButton:checked{background:#801fdd;color:white;}");
+        auto *root = new QVBoxLayout(this); root->setContentsMargins(8,8,8,8); root->setSpacing(8);
+
+        auto *titleRow = new QHBoxLayout;
+        auto *title = new QLabel("PROLENS PTZ CONTROL"); title->setStyleSheet("font-size:15px;font-weight:800;");
+        status = new QLabel("● VISCA IP"); status->setStyleSheet("color:#9b9da3;");
+        titleRow->addWidget(title); titleRow->addStretch(); titleRow->addWidget(status); root->addLayout(titleRow);
+
+        auto *connection = new QGroupBox("Câmera"); auto *cf = new QFormLayout(connection);
+        ipEdit = new QLineEdit; portSpin = new QSpinBox; portSpin->setRange(1,65535); portSpin->setValue(52381); sourceCombo = new QComboBox;
+        auto *sourceRow = new QHBoxLayout; sourceRow->addWidget(sourceCombo,1); sourceRow->addWidget(button("↻", [this]{ refreshSources(); }));
+        cf->addRow("IP", ipEdit); cf->addRow("Porta", portSpin); cf->addRow("Fonte OBS", sourceRow); root->addWidget(connection);
+        connect(ipEdit, &QLineEdit::editingFinished, this, [this]{ syncConnection(); });
+        connect(portSpin, &QSpinBox::valueChanged, this, [this](int){ syncConnection(); });
+        connect(sourceCombo, &QComboBox::currentTextChanged, this, [this](const QString &s){ settings->setValue("camera/source", s); });
+
+        auto *movement = new QGroupBox("Movimento"); auto *mv = new QGridLayout(movement);
+        mv->addWidget(hold("▲", [this]{ client.panTilt(0x03,0x01,ptSpeed(),ptSpeed()); }, [this]{ client.stopPT(); }),0,1);
+        mv->addWidget(hold("◀", [this]{ client.panTilt(0x01,0x03,ptSpeed(),ptSpeed()); }, [this]{ client.stopPT(); }),1,0);
+        mv->addWidget(button("●", [this]{ client.stopPT(); client.zoomStop(); client.focusStop(); }),1,1);
+        mv->addWidget(hold("▶", [this]{ client.panTilt(0x02,0x03,ptSpeed(),ptSpeed()); }, [this]{ client.stopPT(); }),1,2);
+        mv->addWidget(hold("▼", [this]{ client.panTilt(0x03,0x02,ptSpeed(),ptSpeed()); }, [this]{ client.stopPT(); }),2,1);
+        speedSlider = new QSlider(Qt::Horizontal); speedSlider->setRange(1,18); speedSlider->setValue(8);
+        mv->addWidget(new QLabel("Velocidade PT"),3,0); mv->addWidget(speedSlider,3,1,1,2);
+        mv->addWidget(hold("ZOOM −", [this]{ client.zoomWide(zoomSpeed()); }, [this]{ client.zoomStop(); }),4,0);
+        mv->addWidget(hold("ZOOM +", [this]{ client.zoomTele(zoomSpeed()); }, [this]{ client.zoomStop(); }),4,1,1,2);
+        zoomSpeedSlider = new QSlider(Qt::Horizontal); zoomSpeedSlider->setRange(0,7); zoomSpeedSlider->setValue(4);
+        mv->addWidget(new QLabel("Velocidade Z"),5,0); mv->addWidget(zoomSpeedSlider,5,1,1,2); root->addWidget(movement);
+
+        auto *focusBox = new QGroupBox("Foco"); auto *fh = new QHBoxLayout(focusBox);
+        auto *wheel = new FocusWheel;
+        wheel->jog = [this](int value){ if (value > 0) client.focusFar(); else client.focusNear(); QTimer::singleShot(qBound(35,qAbs(value)*2,180),this,[this]{ client.focusStop(); }); };
+        auto *fv = new QVBoxLayout; fv->addWidget(button("AUTO FOCUS", [this]{ client.focusAuto(true); })); fv->addWidget(button("MANUAL", [this]{ client.focusAuto(false); }));
+        auto *fr = new QHBoxLayout; fr->addWidget(hold("NEAR", [this]{ client.focusNear(); }, [this]{ client.focusStop(); })); fr->addWidget(hold("FAR", [this]{ client.focusFar(); }, [this]{ client.focusStop(); })); fv->addLayout(fr);
+        fh->addWidget(wheel); fh->addLayout(fv,1); root->addWidget(focusBox);
+
+        auto *exp = new QGroupBox("Exposição"); auto *eg = new QGridLayout(exp); exposureMode = new QComboBox; exposureMode->addItems({"Auto","Manual"});
+        connect(exposureMode, &QComboBox::currentIndexChanged, this, [this](int i){ client.exposureAuto(i==0); });
+        eg->addWidget(new QLabel("Modo"),0,0); eg->addWidget(exposureMode,0,1,1,2);
+        eg->addWidget(new QLabel("Iris"),1,0); eg->addWidget(button("−", [this]{ client.irisStep(false); }),1,1); eg->addWidget(button("+", [this]{ client.irisStep(true); }),1,2);
+        eg->addWidget(new QLabel("Shutter"),2,0); eg->addWidget(button("−", [this]{ client.shutterStep(false); }),2,1); eg->addWidget(button("+", [this]{ client.shutterStep(true); }),2,2);
+        eg->addWidget(new QLabel("Gain"),3,0); eg->addWidget(button("−", [this]{ client.gainStep(false); }),3,1); eg->addWidget(button("+", [this]{ client.gainStep(true); }),3,2); root->addWidget(exp);
+
+        auto *trackBox = new QGroupBox("Auto Tracking"); auto *tv = new QVBoxLayout(trackBox);
+        tracking = new QToolButton; tracking->setText("TRACKING OFF"); tracking->setCheckable(true); tracking->setMinimumHeight(38);
+        connect(tracking, &QToolButton::toggled, this, [this](bool on){ tracking->setText(on?"TRACKING ON":"TRACKING OFF"); client.sendHex(on?trackOnHex->text():trackOffHex->text()); });
+        tv->addWidget(tracking);
+        auto *advanced = new QWidget; auto *afm = new QFormLayout(advanced); afm->setContentsMargins(0,0,0,0); trackOnHex = new QLineEdit; trackOffHex = new QLineEdit;
+        trackOnHex->setPlaceholderText("HEX VISCA do Tracking ON"); trackOffHex->setPlaceholderText("HEX VISCA do Tracking OFF"); afm->addRow("ON HEX",trackOnHex); afm->addRow("OFF HEX",trackOffHex);
+        auto *toggleAdv = new QToolButton; toggleAdv->setText("Comando de tracking ▾"); toggleAdv->setCheckable(true); advanced->setVisible(false);
+        connect(toggleAdv, &QToolButton::toggled, advanced, &QWidget::setVisible); connect(trackOnHex,&QLineEdit::editingFinished,this,[this]{ settings->setValue("tracking/on",trackOnHex->text()); }); connect(trackOffHex,&QLineEdit::editingFinished,this,[this]{ settings->setValue("tracking/off",trackOffHex->text()); });
+        tv->addWidget(toggleAdv); tv->addWidget(advanced); root->addWidget(trackBox);
+
+        auto *presets = new QGroupBox("Presets visuais"); auto *pg = new QGridLayout(presets);
+        for (int i=0;i<PRESET_COUNT;++i) {
+            auto *card = new QToolButton; card->setToolButtonStyle(Qt::ToolButtonTextUnderIcon); card->setIconSize(QSize(150,84)); card->setMinimumSize(165,118); card->setText(QString("Preset %1").arg(i+1)); card->setContextMenuPolicy(Qt::CustomContextMenu);
+            connect(card,&QToolButton::clicked,this,[this,i]{ client.presetRecall(i); }); connect(card,&QToolButton::customContextMenuRequested,this,[this,i](const QPoint&){ savePreset(i); }); presetButtons[i]=card; pg->addWidget(card,i/2,i%2);
+        }
+        auto *hint = new QLabel("Clique: chamar preset   •   Botão direito: salvar posição + miniatura"); hint->setWordWrap(true); pg->addWidget(hint,PRESET_COUNT/2,0,1,2); root->addWidget(presets); root->addStretch();
+    }
+
+    void syncConnection()
+    {
+        client.host = ipEdit->text().trimmed(); client.port = quint16(portSpin->value()); settings->setValue("camera/ip",client.host); settings->setValue("camera/port",client.port);
+        status->setText(QString("● %1:%2").arg(client.host).arg(client.port)); status->setStyleSheet("color:#801fdd;font-weight:700;");
+    }
+    void loadSettings()
+    {
+        ipEdit->setText(settings->value("camera/ip","192.168.1.100").toString()); portSpin->setValue(settings->value("camera/port",52381).toInt()); trackOnHex->setText(settings->value("tracking/on","").toString()); trackOffHex->setText(settings->value("tracking/off","").toString());
+        for(int i=0;i<PRESET_COUNT;++i){ presetImages[i]=settings->value(QString("preset/%1/image").arg(i)).toString(); updatePresetButton(i);} syncConnection();
+    }
+    void refreshSources()
+    {
+        const QString previous = settings->value("camera/source").toString(); sourceCombo->blockSignals(true); sourceCombo->clear();
+        obs_enum_sources([](void *data, obs_source_t *source){ auto *combo=static_cast<QComboBox*>(data); if(obs_source_get_output_flags(source)&OBS_SOURCE_VIDEO) combo->addItem(QString::fromUtf8(obs_source_get_name(source))); return true; },sourceCombo);
+        int idx=sourceCombo->findText(previous); if(idx>=0) sourceCombo->setCurrentIndex(idx); sourceCombo->blockSignals(false);
+    }
+    void savePreset(int i)
+    {
+        client.presetSet(i); pendingPreset=i; QByteArray name=sourceCombo->currentText().toUtf8(); obs_source_t *source=obs_get_source_by_name(name.constData());
+        if(source){ obs_frontend_take_source_screenshot(source); obs_source_release(source);} else pendingPreset=-1;
+    }
+    void updatePresetButton(int i)
+    {
+        if(!presetButtons[i]) return; const QString path=presetImages[i]; if(!path.isEmpty()&&QFileInfo::exists(path)){ QPixmap p(path); if(!p.isNull()) presetButtons[i]->setIcon(QIcon(p.scaled(150,84,Qt::KeepAspectRatioByExpanding,Qt::SmoothTransformation))); }
     }
 };
 
-static void push_setting(ProGradeFilter *f, const char *key, double v)
+static ProlensPtzDock *g_dock = nullptr;
+
+static void frontendEvent(enum obs_frontend_event event, void *)
 {
-    obs_data_t *s = obs_source_get_settings(f->context);
-    obs_data_set_double(s, key, v);
-    obs_source_update(f->context, s);
-    obs_data_release(s);
-}
-
-static void push_color(ProGradeFilter *f, const char *key, const QColor &c)
-{
-    obs_data_t *s = obs_source_get_settings(f->context);
-    obs_data_set_int(s, key, (long long)color_to_obs(c));
-    obs_source_update(f->context, s);
-    obs_data_release(s);
-}
-
-static QWidget *wheel_block(ProGradeFilter *f, const QString &title, const char *colorKey,
-                            const char *lumaKey, const QColor &initial, double luma)
-{
-    QWidget *box = new QWidget;
-    QVBoxLayout *v = new QVBoxLayout(box);
-    v->setContentsMargins(8, 8, 8, 8);
-    QLabel *label = new QLabel(title);
-    label->setAlignment(Qt::AlignCenter);
-    label->setStyleSheet("font-weight:600; font-size:13px;");
-    ColorWheel *wheel = new ColorWheel;
-    wheel->value = initial;
-    wheel->changed = [f, colorKey](const QColor &c) { push_color(f, colorKey, c); };
-    QSlider *slider = new QSlider(Qt::Horizontal);
-    slider->setRange(-100, 100);
-    slider->setValue((int)std::round(luma * 100.0));
-    QLabel *l = new QLabel("Luminance");
-    l->setAlignment(Qt::AlignCenter);
-    QObject::connect(slider, &QSlider::valueChanged, [f, lumaKey](int value) {
-        push_setting(f, lumaKey, value / 100.0);
-    });
-    v->addWidget(label);
-    v->addWidget(wheel, 0, Qt::AlignCenter);
-    v->addWidget(l);
-    v->addWidget(slider);
-    return box;
-}
-
-static QWidget *lut_block(ProGradeFilter *f, const QString &title, const char *pathKey,
-                          const char *mixKey, const std::string &initialPath, double initialMix)
-{
-    QWidget *box = new QWidget;
-    QVBoxLayout *v = new QVBoxLayout(box);
-    QLabel *label = new QLabel(title);
-    label->setStyleSheet("font-weight:600;");
-    QHBoxLayout *row = new QHBoxLayout;
-    QLineEdit *edit = new QLineEdit(QString::fromStdString(initialPath));
-    QPushButton *browse = new QPushButton("Browse...");
-    row->addWidget(edit, 1);
-    row->addWidget(browse);
-    QSlider *mix = new QSlider(Qt::Horizontal);
-    mix->setRange(0, 100);
-    mix->setValue((int)std::round(initialMix * 100.0));
-
-    auto commitPath = [f, edit, pathKey]() {
-        obs_data_t *s = obs_source_get_settings(f->context);
-        obs_data_set_string(s, pathKey, edit->text().toUtf8().constData());
-        obs_source_update(f->context, s);
-        obs_data_release(s);
-        ensure_luts(f);
-    };
-
-    QObject::connect(browse, &QPushButton::clicked, [edit, commitPath]() {
-        QString path = QFileDialog::getOpenFileName(nullptr, "Choose LUT", QString(),
-                                                    "LUT files (*.cube *.png)");
-        if (!path.isEmpty()) {
-            edit->setText(path);
-            commitPath();
-        }
-    });
-    QObject::connect(edit, &QLineEdit::editingFinished, commitPath);
-    QObject::connect(mix, &QSlider::valueChanged, [f, mixKey](int value) {
-        push_setting(f, mixKey, value / 100.0);
-        ensure_luts(f);
-    });
-
-    v->addWidget(label);
-    v->addLayout(row);
-    v->addWidget(new QLabel("Mix"));
-    v->addWidget(mix);
-    return box;
-}
-
-static void show_panel(ProGradeFilter *f)
-{
-    if (!f)
-        return;
-    ensure_luts(f);
-
-    QWidget *parent = static_cast<QWidget *>(obs_frontend_get_main_window());
-    QDialog dlg(parent);
-    dlg.setWindowTitle("ProGrade Color");
-    dlg.resize(980, 640);
-    dlg.setStyleSheet(
-        "QDialog{background:#1e1f22;color:#eeeeee;}"
-        "QWidget{color:#eeeeee;}"
-        "QLineEdit{background:#2a2b2f;border:1px solid #55565c;padding:6px;border-radius:4px;}"
-        "QPushButton{background:#34353a;border:1px solid #5a5b62;padding:7px 12px;border-radius:5px;}"
-        "QPushButton:hover{background:#404148;}"
-    );
-
-    QVBoxLayout *root = new QVBoxLayout(&dlg);
-    QLabel *title = new QLabel("PROGRADE  •  PRIMARY WHEELS");
-    title->setStyleSheet("font-weight:700;font-size:17px;");
-    root->addWidget(title);
-
-    QGridLayout *grid = new QGridLayout;
-    grid->addWidget(wheel_block(f, "LIFT / BLACKS", "lift_color", "lift_luma", f->lift, f->liftLuma), 0, 0);
-    grid->addWidget(wheel_block(f, "GAMMA / MIDS", "gamma_color", "gamma_luma", f->gamma, f->gammaLuma), 0, 1);
-    grid->addWidget(wheel_block(f, "GAIN / WHITES", "gain_color", "gain_luma", f->gain, f->gainLuma), 0, 2);
-    grid->addWidget(wheel_block(f, "OFFSET / GLOBAL", "offset_color", "offset_luma", f->offset, f->offsetLuma), 0, 3);
-    root->addLayout(grid);
-
-    QLabel *satLabel = new QLabel("Saturation");
-    satLabel->setStyleSheet("font-weight:600;");
-    QSlider *sat = new QSlider(Qt::Horizontal);
-    sat->setRange(0, 200);
-    sat->setValue((int)std::round(f->saturation * 100.0));
-    QObject::connect(sat, &QSlider::valueChanged, [f](int value) {
-        push_setting(f, "saturation", value / 100.0);
-    });
-    root->addWidget(satLabel);
-    root->addWidget(sat);
-
-    QHBoxLayout *luts = new QHBoxLayout;
-    luts->addWidget(lut_block(f, "LUT 1", "lut1_path", "lut1_mix", f->lut1Path, f->lut1Mix));
-    luts->addWidget(lut_block(f, "LUT 2", "lut2_path", "lut2_mix", f->lut2Path, f->lut2Mix));
-    root->addLayout(luts);
-
-    QHBoxLayout *buttons = new QHBoxLayout;
-    QPushButton *reset = new QPushButton("Reset primaries");
-    QPushButton *close = new QPushButton("Close");
-    buttons->addWidget(reset);
-    buttons->addStretch();
-    buttons->addWidget(close);
-    QObject::connect(reset, &QPushButton::clicked, [f, &dlg]() {
-        obs_data_t *s = obs_source_get_settings(f->context);
-        const uint32_t neutral = 0x808080;
-        obs_data_set_int(s, "lift_color", neutral);
-        obs_data_set_int(s, "gamma_color", neutral);
-        obs_data_set_int(s, "gain_color", neutral);
-        obs_data_set_int(s, "offset_color", neutral);
-        obs_data_set_double(s, "lift_luma", 0.0);
-        obs_data_set_double(s, "gamma_luma", 0.0);
-        obs_data_set_double(s, "gain_luma", 0.0);
-        obs_data_set_double(s, "offset_luma", 0.0);
-        obs_data_set_double(s, "saturation", 1.0);
-        obs_source_update(f->context, s);
-        obs_data_release(s);
-        dlg.accept();
-        show_panel(f);
-    });
-    QObject::connect(close, &QPushButton::clicked, &dlg, &QDialog::accept);
-    root->addLayout(buttons);
-    dlg.exec();
-}
-
-static const char *filter_name(void *)
-{
-    return "ProGrade - Color Wheels + Dual LUT";
-}
-
-static void filter_update(void *data, obs_data_t *settings)
-{
-    auto *f = static_cast<ProGradeFilter *>(data);
-    if (!f)
-        return;
-    f->lift = color_from_obs(settings, "lift_color");
-    f->gamma = color_from_obs(settings, "gamma_color");
-    f->gain = color_from_obs(settings, "gain_color");
-    f->offset = color_from_obs(settings, "offset_color");
-    f->liftLuma = obs_data_get_double(settings, "lift_luma");
-    f->gammaLuma = obs_data_get_double(settings, "gamma_luma");
-    f->gainLuma = obs_data_get_double(settings, "gain_luma");
-    f->offsetLuma = obs_data_get_double(settings, "offset_luma");
-    f->saturation = obs_data_get_double(settings, "saturation");
-    f->lut1Path = obs_data_get_string(settings, "lut1_path");
-    f->lut2Path = obs_data_get_string(settings, "lut2_path");
-    f->lut1Mix = obs_data_get_double(settings, "lut1_mix");
-    f->lut2Mix = obs_data_get_double(settings, "lut2_mix");
-    if (f->lut1 || f->lut2)
-        ensure_luts(f);
-}
-
-static void filter_defaults(obs_data_t *settings)
-{
-    const uint32_t neutral = 0x808080;
-    obs_data_set_default_int(settings, "lift_color", neutral);
-    obs_data_set_default_int(settings, "gamma_color", neutral);
-    obs_data_set_default_int(settings, "gain_color", neutral);
-    obs_data_set_default_int(settings, "offset_color", neutral);
-    obs_data_set_default_double(settings, "lift_luma", 0.0);
-    obs_data_set_default_double(settings, "gamma_luma", 0.0);
-    obs_data_set_default_double(settings, "gain_luma", 0.0);
-    obs_data_set_default_double(settings, "offset_luma", 0.0);
-    obs_data_set_default_double(settings, "saturation", 1.0);
-    obs_data_set_default_string(settings, "lut1_path", "");
-    obs_data_set_default_string(settings, "lut2_path", "");
-    obs_data_set_default_double(settings, "lut1_mix", 1.0);
-    obs_data_set_default_double(settings, "lut2_mix", 1.0);
-}
-
-static bool open_panel_button(obs_properties_t *, obs_property_t *, void *data)
-{
-    show_panel(static_cast<ProGradeFilter *>(data));
-    return true;
-}
-
-static obs_properties_t *filter_properties(void *data)
-{
-    obs_properties_t *props = obs_properties_create();
-    obs_properties_add_text(props, "info",
-                            "Open the native ProGrade panel for four real color wheels, saturation and two LUT slots.",
-                            OBS_TEXT_INFO);
-    obs_properties_add_button(props, "open_panel", "Open ProGrade Color Panel", open_panel_button);
-    (void)data;
-    return props;
-}
-
-static void *filter_create(obs_data_t *settings, obs_source_t *context)
-{
-    auto *f = new ProGradeFilter;
-    f->context = context;
-    obs_enter_graphics();
-    f->effect = gs_effect_create(effect_text, "prograde.effect", nullptr);
-    if (f->effect) {
-        f->pLift = gs_effect_get_param_by_name(f->effect, "lift_color");
-        f->pLiftLuma = gs_effect_get_param_by_name(f->effect, "lift_luma");
-        f->pGamma = gs_effect_get_param_by_name(f->effect, "gamma_color");
-        f->pGammaLuma = gs_effect_get_param_by_name(f->effect, "gamma_luma");
-        f->pGain = gs_effect_get_param_by_name(f->effect, "gain_color");
-        f->pGainLuma = gs_effect_get_param_by_name(f->effect, "gain_luma");
-        f->pOffset = gs_effect_get_param_by_name(f->effect, "offset_color");
-        f->pOffsetLuma = gs_effect_get_param_by_name(f->effect, "offset_luma");
-        f->pSaturation = gs_effect_get_param_by_name(f->effect, "saturation");
-    }
-    obs_leave_graphics();
-    if (!f->effect) {
-        delete f;
-        return nullptr;
-    }
-    filter_update(f, settings);
-    return f;
-}
-
-static void filter_destroy(void *data)
-{
-    auto *f = static_cast<ProGradeFilter *>(data);
-    if (!f)
-        return;
-    if (f->parent) {
-        if (f->lut1)
-            obs_source_filter_remove(f->parent, f->lut1);
-        if (f->lut2)
-            obs_source_filter_remove(f->parent, f->lut2);
-    }
-    if (f->lut1)
-        obs_source_release(f->lut1);
-    if (f->lut2)
-        obs_source_release(f->lut2);
-    if (f->parent)
-        obs_source_release(f->parent);
-    obs_enter_graphics();
-    gs_effect_destroy(f->effect);
-    obs_leave_graphics();
-    delete f;
-}
-
-static void filter_add(void *data, obs_source_t *source)
-{
-    auto *f = static_cast<ProGradeFilter *>(data);
-    if (!f)
-        return;
-    if (f->parent)
-        obs_source_release(f->parent);
-    f->parent = obs_source_get_ref(source);
-}
-
-static void filter_remove(void *data, obs_source_t *source)
-{
-    auto *f = static_cast<ProGradeFilter *>(data);
-    if (!f)
-        return;
-    if (f->lut1) {
-        obs_source_filter_remove(source, f->lut1);
-        obs_source_release(f->lut1);
-        f->lut1 = nullptr;
-    }
-    if (f->lut2) {
-        obs_source_filter_remove(source, f->lut2);
-        obs_source_release(f->lut2);
-        f->lut2 = nullptr;
-    }
-    if (f->parent) {
-        obs_source_release(f->parent);
-        f->parent = nullptr;
-    }
-}
-
-static void filter_render(void *data, gs_effect_t *)
-{
-    auto *f = static_cast<ProGradeFilter *>(data);
-    if (!f || !f->effect) {
-        if (f)
-            obs_source_skip_video_filter(f->context);
-        return;
-    }
-
-    if (!obs_source_process_filter_begin(f->context, GS_RGBA, OBS_NO_DIRECT_RENDERING))
-        return;
-
-    set_bias(f->pLift, f->lift);
-    gs_effect_set_float(f->pLiftLuma, (float)f->liftLuma);
-    set_bias(f->pGamma, f->gamma);
-    gs_effect_set_float(f->pGammaLuma, (float)f->gammaLuma);
-    set_bias(f->pGain, f->gain);
-    gs_effect_set_float(f->pGainLuma, (float)f->gainLuma);
-    set_bias(f->pOffset, f->offset);
-    gs_effect_set_float(f->pOffsetLuma, (float)f->offsetLuma);
-    gs_effect_set_float(f->pSaturation, (float)f->saturation);
-
-    obs_source_process_filter_end(f->context, f->effect, 0, 0);
+    if (event == OBS_FRONTEND_EVENT_SCREENSHOT_TAKEN && g_dock)
+        QMetaObject::invokeMethod(g_dock, []{ if(g_dock) g_dock->screenshotReady(); }, Qt::QueuedConnection);
 }
 
 bool obs_module_load(void)
 {
-    obs_source_info info = {};
-    info.id = FILTER_ID;
-    info.type = OBS_SOURCE_TYPE_FILTER;
-    info.output_flags = OBS_SOURCE_VIDEO;
-    info.get_name = filter_name;
-    info.create = filter_create;
-    info.destroy = filter_destroy;
-    info.update = filter_update;
-    info.get_defaults = filter_defaults;
-    info.get_properties = filter_properties;
-    info.video_render = filter_render;
-    info.filter_add = filter_add;
-    info.filter_remove = filter_remove;
-    obs_register_source(&info);
-    blog(LOG_INFO, "[ProGrade] loaded");
+    g_dock = new ProlensPtzDock;
+    if (!obs_frontend_add_dock_by_id(DOCK_ID, "Prolens PTZ Control", g_dock)) { delete g_dock; g_dock=nullptr; return false; }
+    obs_frontend_add_event_callback(frontendEvent, nullptr);
+    blog(LOG_INFO, "[Prolens PTZ] v0.1 loaded");
     return true;
+}
+
+void obs_module_unload(void)
+{
+    obs_frontend_remove_event_callback(frontendEvent, nullptr);
+    obs_frontend_remove_dock(DOCK_ID);
+    g_dock = nullptr;
 }
