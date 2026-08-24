@@ -35,12 +35,25 @@ OBS_MODULE_USE_DEFAULT_LOCALE("obs-prograde", "en-US")
 
 MODULE_EXPORT const char *obs_module_description(void)
 {
-    return "ProGrade: lightweight realtime GPU color grading with embedded scopes";
+    return "ProGrade: ultra-light realtime GPU color grading with RGB waveform";
 }
 
 static const char *FILTER_ID = "prograde_filter";
-static constexpr int SCOPE_W = 320;
-static constexpr int SCOPE_H = 180;
+static constexpr int SCOPE_W = 96;
+static constexpr int SCOPE_H = 54;
+static constexpr uint32_t SCOPE_INTERVAL_FRAMES = 60;
+
+static uint32_t qcolor_to_packed(const QColor &c)
+{
+    return static_cast<uint32_t>(c.red()) | (static_cast<uint32_t>(c.green()) << 8) |
+           (static_cast<uint32_t>(c.blue()) << 16);
+}
+
+static QColor packed_to_qcolor(uint32_t c)
+{
+    return QColor(static_cast<int>(c & 0xff), static_cast<int>((c >> 8) & 0xff),
+                  static_cast<int>((c >> 16) & 0xff));
+}
 
 struct ProGradeFilter {
     obs_source_t *context = nullptr;
@@ -67,23 +80,22 @@ struct ProGradeFilter {
     gs_eparam_t *pHalationRadius = nullptr;
     gs_eparam_t *pHalationStrength = nullptr;
 
-    std::mutex paramMutex;
-    QColor lift = QColor(128, 128, 128);
-    QColor gamma = QColor(128, 128, 128);
-    QColor gain = QColor(128, 128, 128);
-    QColor offset = QColor(128, 128, 128);
-    double liftLuma = 0.0;
-    double gammaLuma = 0.0;
-    double gainLuma = 0.0;
-    double offsetLuma = 0.0;
-    double saturation = 1.0;
+    std::atomic<uint32_t> lift{0x808080};
+    std::atomic<uint32_t> gamma{0x808080};
+    std::atomic<uint32_t> gain{0x808080};
+    std::atomic<uint32_t> offset{0x808080};
+    std::atomic<float> liftLuma{0.0f};
+    std::atomic<float> gammaLuma{0.0f};
+    std::atomic<float> gainLuma{0.0f};
+    std::atomic<float> offsetLuma{0.0f};
+    std::atomic<float> saturation{1.0f};
 
-    double bloomThreshold = 0.72;
-    double bloomRadius = 8.0;
-    double bloomStrength = 0.0;
-    double halationThreshold = 0.78;
-    double halationRadius = 5.0;
-    double halationStrength = 0.0;
+    std::atomic<float> bloomThreshold{0.72f};
+    std::atomic<float> bloomRadius{8.0f};
+    std::atomic<float> bloomStrength{0.0f};
+    std::atomic<float> halationThreshold{0.78f};
+    std::atomic<float> halationRadius{5.0f};
+    std::atomic<float> halationStrength{0.0f};
 
     std::string cstPath;
     double cstMix = 1.0;
@@ -92,11 +104,15 @@ struct ProGradeFilter {
     double lut1Mix = 1.0;
     double lut2Mix = 1.0;
 
-    std::atomic<bool> scopesEnabled{false};
+    std::atomic<bool> scopeEnabled{false};
+    std::atomic<bool> uiInteracting{false};
     uint32_t scopeFrameCounter = 0;
     std::mutex scopeMutex;
     std::vector<uint32_t> scopePixels;
     bool scopeValid = false;
+
+    uint32_t cachedWidth = 1920;
+    uint32_t cachedHeight = 1080;
 };
 
 static const char *effect_text = R"(
@@ -143,27 +159,15 @@ float luma709(float3 c)
     return dot(c, float3(0.2126, 0.7152, 0.0722));
 }
 
-float3 sat_adjust(float3 c, float sat)
-{
-    float y = luma709(c);
-    return lerp(float3(y, y, y), c, sat);
-}
-
-float highlight_mask(float3 c, float threshold)
-{
-    float m = max(c.r, max(c.g, c.b));
-    return smoothstep(threshold, min(1.0, threshold + 0.18), m);
-}
-
 float3 blur_fast(float2 uv, float radius)
 {
     float2 s = texel_size * max(0.5, radius);
-    float3 sum = image.Sample(textureSampler, uv).rgb * 0.40;
-    sum += image.Sample(textureSampler, uv + s).rgb * 0.15;
-    sum += image.Sample(textureSampler, uv - s).rgb * 0.15;
-    sum += image.Sample(textureSampler, uv + float2(s.x, -s.y)).rgb * 0.15;
-    sum += image.Sample(textureSampler, uv + float2(-s.x, s.y)).rgb * 0.15;
-    return sum;
+    float3 center = image.Sample(textureSampler, uv).rgb * 0.50;
+    center += image.Sample(textureSampler, uv + s).rgb * 0.125;
+    center += image.Sample(textureSampler, uv - s).rgb * 0.125;
+    center += image.Sample(textureSampler, uv + float2(s.x, -s.y)).rgb * 0.125;
+    center += image.Sample(textureSampler, uv + float2(-s.x, s.y)).rgb * 0.125;
+    return center;
 }
 
 float4 PSProGrade(VertData v_in) : TARGET
@@ -174,35 +178,36 @@ float4 PSProGrade(VertData v_in) : TARGET
 
     float shadow = 1.0 - smoothstep(0.12, 0.58, lum);
     float high = smoothstep(0.42, 0.92, lum);
-    float mid = saturate(1.0 - abs(lum - 0.5) * 2.15);
-    mid = smoothstep(0.0, 1.0, mid);
+    float mid = smoothstep(0.0, 1.0, saturate(1.0 - abs(lum - 0.5) * 2.15));
 
     c += offset_luma * 0.32;
     c += offset_color * 0.32;
     c += shadow * lift_luma * 0.28;
     c += shadow * lift_color * 0.32;
 
-    float g = exp(-gamma_luma * 1.25);
-    float3 gc = pow(max(c, 0.00001), float3(g, g, g));
+    float gg = exp(-gamma_luma * 1.25);
+    float3 gc = pow(max(c, 0.00001), float3(gg, gg, gg));
     c = lerp(c, gc, mid);
     c += mid * gamma_color * 0.26;
 
     c *= 1.0 + high * gain_luma * 0.65;
     c += high * gain_color * 0.30;
-    c = sat_adjust(c, saturation);
+
+    float y = luma709(c);
+    c = lerp(float3(y, y, y), c, saturation);
 
     if (bloom_strength > 0.0001) {
         float3 b = blur_fast(v_in.uv, bloom_radius);
-        float mask = highlight_mask(b, bloom_threshold);
-        float3 glow = b * mask * bloom_strength;
+        float m = smoothstep(bloom_threshold, min(1.0, bloom_threshold + 0.18), max(b.r, max(b.g, b.b)));
+        float3 glow = b * m * bloom_strength;
         c = 1.0 - (1.0 - saturate(c)) * (1.0 - saturate(glow));
     }
 
     if (halation_strength > 0.0001) {
         float3 h = blur_fast(v_in.uv, halation_radius);
-        float mask = highlight_mask(h, halation_threshold);
-        float redHalo = h.r * mask * halation_strength;
-        c += float3(redHalo, redHalo * 0.10, redHalo * 0.025);
+        float m = smoothstep(halation_threshold, min(1.0, halation_threshold + 0.18), max(h.r, max(h.g, h.b)));
+        float halo = h.r * m * halation_strength;
+        c += float3(halo, halo * 0.10, halo * 0.025);
     }
 
     return float4(max(c, 0.0), px.a);
@@ -218,6 +223,17 @@ technique Draw
 }
 )";
 
+static void set_bias(gs_eparam_t *param, uint32_t packed)
+{
+    const float r = static_cast<float>(packed & 0xff) / 255.0f;
+    const float g = static_cast<float>((packed >> 8) & 0xff) / 255.0f;
+    const float b = static_cast<float>((packed >> 16) & 0xff) / 255.0f;
+    const float avg = (r + g + b) / 3.0f;
+    vec3 v;
+    vec3_set(&v, r - avg, g - avg, b - avg);
+    gs_effect_set_vec3(param, &v);
+}
+
 static inline uint8_t clamp_byte(float v)
 {
     return static_cast<uint8_t>(std::clamp(v, 0.0f, 255.0f));
@@ -226,19 +242,15 @@ static inline uint8_t clamp_byte(float v)
 static void yuv_to_rgb(uint8_t yv, uint8_t uv, uint8_t vv, bool full, uint8_t &r, uint8_t &g, uint8_t &b)
 {
     float y;
-    float u;
-    float v;
+    const float u = static_cast<float>(uv) - 128.0f;
+    const float v = static_cast<float>(vv) - 128.0f;
     if (full) {
         y = static_cast<float>(yv);
-        u = static_cast<float>(uv) - 128.0f;
-        v = static_cast<float>(vv) - 128.0f;
         r = clamp_byte(y + 1.5748f * v);
         g = clamp_byte(y - 0.1873f * u - 0.4681f * v);
         b = clamp_byte(y + 1.8556f * u);
     } else {
         y = 1.16438f * (static_cast<float>(yv) - 16.0f);
-        u = static_cast<float>(uv) - 128.0f;
-        v = static_cast<float>(vv) - 128.0f;
         r = clamp_byte(y + 1.79274f * v);
         g = clamp_byte(y - 0.21325f * u - 0.53291f * v);
         b = clamp_byte(y + 2.11240f * u);
@@ -292,24 +304,18 @@ static bool read_frame_rgb(const obs_source_frame *frame, uint32_t x, uint32_t y
         yuv_to_rgb(yy, p[0], p[2], frame->full_range, r, g, b);
         return true;
     }
-    case VIDEO_FORMAT_YVYU: {
-        const uint8_t *p = frame->data[0] + y * frame->linesize[0] + (x / 2) * 4;
-        const uint8_t yy = (x & 1) ? p[2] : p[0];
-        yuv_to_rgb(yy, p[3], p[1], frame->full_range, r, g, b);
-        return true;
-    }
     default:
         return false;
     }
 }
 
-static void capture_scope_frame(ProGradeFilter *f)
+static void capture_waveform_samples(ProGradeFilter *f)
 {
-    if (!f || !f->parent || !f->scopesEnabled.load(std::memory_order_relaxed))
+    if (!f || !f->parent || !f->scopeEnabled.load(std::memory_order_relaxed) ||
+        f->uiInteracting.load(std::memory_order_relaxed))
         return;
 
-    const uint32_t flags = obs_source_get_output_flags(f->parent);
-    if ((flags & OBS_SOURCE_ASYNC_VIDEO) == 0)
+    if ((obs_source_get_output_flags(f->parent) & OBS_SOURCE_ASYNC_VIDEO) == 0)
         return;
 
     obs_source_frame *frame = obs_source_get_frame(f->parent);
@@ -317,7 +323,7 @@ static void capture_scope_frame(ProGradeFilter *f)
         return;
 
     std::vector<uint32_t> pixels(static_cast<size_t>(SCOPE_W) * SCOPE_H);
-    bool valid = true;
+    bool valid = frame->width > 0 && frame->height > 0;
     for (int sy = 0; sy < SCOPE_H && valid; ++sy) {
         const uint32_t srcY = std::min(frame->height - 1,
                                        static_cast<uint32_t>((static_cast<uint64_t>(sy) * frame->height) / SCOPE_H));
@@ -332,8 +338,7 @@ static void capture_scope_frame(ProGradeFilter *f)
                 break;
             }
             pixels[static_cast<size_t>(sy) * SCOPE_W + sx] =
-                0xff000000u | (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8) |
-                static_cast<uint32_t>(b);
+                (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
         }
     }
     obs_source_release_frame(f->parent, frame);
@@ -343,30 +348,6 @@ static void capture_scope_frame(ProGradeFilter *f)
         f->scopePixels.swap(pixels);
         f->scopeValid = true;
     }
-}
-
-static QColor color_from_obs(obs_data_t *settings, const char *key)
-{
-    uint32_t c = static_cast<uint32_t>(obs_data_get_int(settings, key));
-    return QColor(static_cast<int>(c & 0xff), static_cast<int>((c >> 8) & 0xff),
-                  static_cast<int>((c >> 16) & 0xff));
-}
-
-static uint32_t color_to_obs(const QColor &c)
-{
-    return static_cast<uint32_t>(c.red()) | (static_cast<uint32_t>(c.green()) << 8) |
-           (static_cast<uint32_t>(c.blue()) << 16);
-}
-
-static void set_bias(gs_eparam_t *param, const QColor &c)
-{
-    const float r = static_cast<float>(c.redF());
-    const float g = static_cast<float>(c.greenF());
-    const float b = static_cast<float>(c.blueF());
-    const float avg = (r + g + b) / 3.0f;
-    vec3 v;
-    vec3_set(&v, r - avg, g - avg, b - avg);
-    gs_effect_set_vec3(param, &v);
 }
 
 static void update_native_lut(obs_source_t *lut, const std::string &path, double mix)
@@ -429,46 +410,52 @@ static void persist_double(ProGradeFilter *f, const char *key, double value)
     obs_data_release(settings);
 }
 
-static void persist_color(ProGradeFilter *f, const char *key, const QColor &color)
+static void persist_color(ProGradeFilter *f, const char *key, uint32_t value)
 {
     obs_data_t *settings = obs_source_get_settings(f->context);
-    obs_data_set_int(settings, key, static_cast<long long>(color_to_obs(color)));
+    obs_data_set_int(settings, key, static_cast<long long>(value));
     obs_source_update(f->context, settings);
     obs_data_release(settings);
 }
 
 class ColorWheel : public QWidget {
 public:
-    QColor value = QColor(128, 128, 128);
-    std::function<void(const QColor &)> changed;
-    std::function<void(const QColor &)> committed;
+    uint32_t value = 0x808080;
+    std::function<void(uint32_t)> changed;
+    std::function<void(uint32_t)> committed;
+    std::function<void(bool)> interaction;
 
     explicit ColorWheel(QWidget *parent = nullptr) : QWidget(parent)
     {
-        setMinimumSize(176, 176);
-        setMaximumSize(210, 210);
+        setMinimumSize(185, 185);
+        setMaximumSize(220, 220);
+        setMouseTracking(false);
     }
 
 protected:
+    void resizeEvent(QResizeEvent *) override { cacheDirty = true; }
+
     void paintEvent(QPaintEvent *) override
     {
+        ensureCache();
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing, true);
         const int side = std::min(width(), height()) - 16;
-        ensureWheelCache(side);
-        QRectF rect((width() - side) / 2.0, (height() - side) / 2.0, side, side);
+        const QRectF rect((width() - side) / 2.0, (height() - side) / 2.0, side, side);
         const QPointF center = rect.center();
         const double radius = rect.width() / 2.0;
 
-        p.drawImage(rect.topLeft(), wheelCache);
-        p.setPen(QPen(QColor(20, 20, 22), 5));
+        if (!wheelCache.isNull())
+            p.drawImage(rect.topLeft(), wheelCache);
+
+        p.setPen(QPen(QColor(18, 18, 20), 5));
         p.setBrush(Qt::NoBrush);
         p.drawEllipse(rect.adjusted(1, 1, -1, -1));
-        p.setPen(QPen(QColor(92, 92, 98), 1));
+        p.setPen(QPen(QColor(90, 90, 96), 1));
         p.drawLine(QPointF(center.x() - 8, center.y()), QPointF(center.x() + 8, center.y()));
         p.drawLine(QPointF(center.x(), center.y() - 8), QPointF(center.x(), center.y() + 8));
 
-        const QColor hsv = value.toHsv();
+        QColor hsv = packed_to_qcolor(value).toHsv();
         double hue = hsv.hsvHueF();
         if (hue < 0.0)
             hue = 0.0;
@@ -476,15 +463,18 @@ protected:
         const double ang = hue * 2.0 * M_PI;
         const QPointF marker(center.x() + std::cos(ang) * sat * radius,
                              center.y() - std::sin(ang) * sat * radius);
-        p.setBrush(QColor(235, 235, 238));
-        p.setPen(QPen(QColor(15, 15, 16), 2));
-        p.drawEllipse(marker, 6.5, 6.5);
+        p.setBrush(QColor(238, 238, 240));
+        p.setPen(QPen(QColor(10, 10, 12), 2));
+        p.drawEllipse(marker, 6.0, 6.0);
     }
 
     void mousePressEvent(QMouseEvent *event) override
     {
-        if (event->button() == Qt::LeftButton)
+        if (event->button() == Qt::LeftButton) {
+            if (interaction)
+                interaction(true);
             setFromPoint(event->position());
+        }
     }
 
     void mouseMoveEvent(QMouseEvent *event) override
@@ -495,38 +485,42 @@ protected:
 
     void mouseReleaseEvent(QMouseEvent *event) override
     {
-        if (event->button() == Qt::LeftButton && committed)
-            committed(value);
+        if (event->button() == Qt::LeftButton) {
+            if (committed)
+                committed(value);
+            if (interaction)
+                interaction(false);
+        }
     }
 
 private:
     QImage wheelCache;
-    int cachedSide = 0;
+    bool cacheDirty = true;
 
-    void ensureWheelCache(int side)
+    void ensureCache()
     {
-        if (cachedSide == side && !wheelCache.isNull())
+        const int side = std::max(1, std::min(width(), height()) - 16);
+        if (!cacheDirty && wheelCache.width() == side && wheelCache.height() == side)
             return;
 
-        cachedSide = side;
         wheelCache = QImage(side, side, QImage::Format_ARGB32_Premultiplied);
         wheelCache.fill(Qt::transparent);
         const double radius = side / 2.0;
         for (int y = 0; y < side; ++y) {
-            QRgb *line = reinterpret_cast<QRgb *>(wheelCache.scanLine(y));
             for (int x = 0; x < side; ++x) {
                 const double dx = x - side / 2.0;
                 const double dy = y - side / 2.0;
                 const double rr = std::sqrt(dx * dx + dy * dy) / radius;
-                if (rr > 1.0)
-                    continue;
-                const double ang = std::atan2(-dy, dx);
-                const double hue = std::fmod(ang / (2.0 * M_PI) + 1.0, 1.0);
-                QColor col;
-                col.setHsvF(static_cast<float>(hue), static_cast<float>(std::min(1.0, rr)), 0.90f);
-                line[x] = col.rgba();
+                if (rr <= 1.0) {
+                    const double ang = std::atan2(-dy, dx);
+                    const double hue = std::fmod(ang / (2.0 * M_PI) + 1.0, 1.0);
+                    QColor col;
+                    col.setHsvF(static_cast<float>(hue), static_cast<float>(std::min(1.0, rr)), 0.90f);
+                    wheelCache.setPixelColor(x, y, col);
+                }
             }
         }
+        cacheDirty = false;
     }
 
     void setFromPoint(const QPointF &point)
@@ -541,171 +535,74 @@ private:
         const double hue = std::fmod(ang / (2.0 * M_PI) + 1.0, 1.0);
         QColor color;
         color.setHsvF(static_cast<float>(hue), static_cast<float>(rr), 0.5f);
-        value = color;
+        value = qcolor_to_packed(color);
         update();
         if (changed)
             changed(value);
     }
 };
 
-enum class ScopeMode { Preview, Waveform, Vectorscope };
-
-class ScopeWidget : public QWidget {
+class WaveformWidget : public QWidget {
 public:
-    ScopeWidget(ProGradeFilter *filter, ScopeMode m, QWidget *parent = nullptr) : QWidget(parent), f(filter), mode(m)
+    explicit WaveformWidget(ProGradeFilter *filter, QWidget *parent = nullptr) : QWidget(parent), f(filter)
     {
-        setMinimumSize(mode == ScopeMode::Waveform ? 340 : 220, 130);
-        timer.setInterval(125);
-        QObject::connect(&timer, &QTimer::timeout, this, QOverload<>::of(&ScopeWidget::update));
-        timer.start();
+        setMinimumHeight(165);
     }
 
 protected:
     void paintEvent(QPaintEvent *) override
     {
-        QPainter painter(this);
-        painter.fillRect(rect(), QColor(8, 9, 11));
-        painter.setRenderHint(QPainter::Antialiasing, false);
+        QPainter p(this);
+        p.fillRect(rect(), QColor(9, 10, 12));
+        p.setRenderHint(QPainter::Antialiasing, false);
 
-        std::vector<uint32_t> pixels;
-        bool valid = false;
+        p.setPen(QPen(QColor(42, 44, 49), 1));
+        for (int i = 0; i <= 4; ++i) {
+            const int y = 8 + ((height() - 16) * i) / 4;
+            p.drawLine(8, y, width() - 8, y);
+        }
+        for (int i = 0; i <= 8; ++i) {
+            const int x = 8 + ((width() - 16) * i) / 8;
+            p.drawLine(x, 8, x, height() - 8);
+        }
+
+        std::vector<uint32_t> samples;
         {
             std::lock_guard<std::mutex> lock(f->scopeMutex);
-            valid = f->scopeValid && f->scopePixels.size() == static_cast<size_t>(SCOPE_W) * SCOPE_H;
-            if (valid)
-                pixels = f->scopePixels;
+            if (!f->scopeValid)
+                return;
+            samples = f->scopePixels;
         }
 
-        if (!valid) {
-            painter.setPen(QColor(125, 127, 135));
-            painter.drawText(rect(), Qt::AlignCenter | Qt::TextWordWrap,
-                             "Scope preview unavailable for this source format");
-            return;
+        const int plotW = std::max(1, width() - 16);
+        const int plotH = std::max(1, height() - 16);
+        for (int sy = 0; sy < SCOPE_H; ++sy) {
+            for (int sx = 0; sx < SCOPE_W; ++sx) {
+                const uint32_t c = samples[static_cast<size_t>(sy) * SCOPE_W + sx];
+                const int r = static_cast<int>((c >> 16) & 0xff);
+                const int g = static_cast<int>((c >> 8) & 0xff);
+                const int b = static_cast<int>(c & 0xff);
+                const int x = 8 + (sx * plotW) / (SCOPE_W - 1);
+                const int yr = 8 + ((255 - r) * plotH) / 255;
+                const int yg = 8 + ((255 - g) * plotH) / 255;
+                const int yb = 8 + ((255 - b) * plotH) / 255;
+                p.setPen(QColor(255, 75, 75, 70));
+                p.drawPoint(x, yr);
+                p.setPen(QColor(80, 255, 110, 65));
+                p.drawPoint(x, yg);
+                p.setPen(QColor(85, 135, 255, 75));
+                p.drawPoint(x, yb);
+            }
         }
-
-        if (mode == ScopeMode::Preview)
-            drawPreview(painter, pixels);
-        else if (mode == ScopeMode::Waveform)
-            drawWaveform(painter, pixels);
-        else
-            drawVectorscope(painter, pixels);
     }
 
 private:
     ProGradeFilter *f;
-    ScopeMode mode;
-    QTimer timer;
-
-    static inline uint8_t red(uint32_t p) { return static_cast<uint8_t>((p >> 16) & 0xff); }
-    static inline uint8_t green(uint32_t p) { return static_cast<uint8_t>((p >> 8) & 0xff); }
-    static inline uint8_t blue(uint32_t p) { return static_cast<uint8_t>(p & 0xff); }
-
-    void drawPreview(QPainter &p, const std::vector<uint32_t> &pixels)
-    {
-        QImage image(reinterpret_cast<const uchar *>(pixels.data()), SCOPE_W, SCOPE_H, SCOPE_W * 4,
-                     QImage::Format_ARGB32);
-        const QRect target = QRect(QPoint(0, 0), size()).adjusted(4, 4, -4, -4);
-        const QImage scaled = image.scaled(target.size(), Qt::KeepAspectRatio, Qt::FastTransformation);
-        const QPoint pos((width() - scaled.width()) / 2, (height() - scaled.height()) / 2);
-        p.drawImage(pos, scaled);
-    }
-
-    void drawGrid(QPainter &p)
-    {
-        p.setPen(QColor(38, 40, 45));
-        for (int i = 1; i < 4; ++i) {
-            const int y = i * height() / 4;
-            p.drawLine(0, y, width(), y);
-        }
-        p.setPen(QColor(83, 85, 92));
-        p.drawRect(rect().adjusted(0, 0, -1, -1));
-    }
-
-    void drawWaveform(QPainter &p, const std::vector<uint32_t> &pixels)
-    {
-        drawGrid(p);
-        const int w = std::max(1, width() - 2);
-        const int h = std::max(1, height() - 2);
-        QImage scope(w, h, QImage::Format_ARGB32);
-        scope.fill(Qt::transparent);
-
-        auto addPoint = [&scope, w, h](int x, int y, int channel) {
-            if (x < 0 || x >= w || y < 0 || y >= h)
-                return;
-            QRgb *line = reinterpret_cast<QRgb *>(scope.scanLine(y));
-            QColor old = QColor::fromRgba(line[x]);
-            int r = old.red();
-            int g = old.green();
-            int b = old.blue();
-            if (channel == 0)
-                r = std::min(255, r + 90);
-            else if (channel == 1)
-                g = std::min(255, g + 90);
-            else
-                b = std::min(255, b + 90);
-            line[x] = qRgba(r, g, b, std::max(150, old.alpha()));
-        };
-
-        for (int sy = 0; sy < SCOPE_H; sy += 3) {
-            for (int sx = 0; sx < SCOPE_W; sx += 2) {
-                const uint32_t px = pixels[static_cast<size_t>(sy) * SCOPE_W + sx];
-                const int x = sx * (w - 1) / (SCOPE_W - 1);
-                addPoint(x, (255 - red(px)) * (h - 1) / 255, 0);
-                addPoint(x, (255 - green(px)) * (h - 1) / 255, 1);
-                addPoint(x, (255 - blue(px)) * (h - 1) / 255, 2);
-            }
-        }
-        p.drawImage(1, 1, scope);
-    }
-
-    void drawVectorscope(QPainter &p, const std::vector<uint32_t> &pixels)
-    {
-        const int side = std::min(width(), height()) - 8;
-        const QRect scopeRect((width() - side) / 2, (height() - side) / 2, side, side);
-        p.setPen(QColor(52, 54, 60));
-        p.drawEllipse(scopeRect);
-        p.drawLine(scopeRect.center().x(), scopeRect.top(), scopeRect.center().x(), scopeRect.bottom());
-        p.drawLine(scopeRect.left(), scopeRect.center().y(), scopeRect.right(), scopeRect.center().y());
-
-        QImage scope(side, side, QImage::Format_ARGB32);
-        scope.fill(Qt::transparent);
-        for (int sy = 0; sy < SCOPE_H; sy += 3) {
-            for (int sx = 0; sx < SCOPE_W; sx += 3) {
-                const uint32_t px = pixels[static_cast<size_t>(sy) * SCOPE_W + sx];
-                const float rf = red(px) / 255.0f;
-                const float gf = green(px) / 255.0f;
-                const float bf = blue(px) / 255.0f;
-                const float y = 0.2126f * rf + 0.7152f * gf + 0.0722f * bf;
-                const float u = (bf - y) * 0.5389f;
-                const float v = (rf - y) * 0.6350f;
-                const int x = std::clamp(static_cast<int>((0.5f + u) * (side - 1)), 0, side - 1);
-                const int yy = std::clamp(static_cast<int>((0.5f - v) * (side - 1)), 0, side - 1);
-                QRgb *line = reinterpret_cast<QRgb *>(scope.scanLine(yy));
-                QColor old = QColor::fromRgba(line[x]);
-                line[x] = qRgba(std::min(255, old.red() + 42), std::min(255, old.green() + 55),
-                                std::min(255, old.blue() + 42), 200);
-            }
-        }
-        p.drawImage(scopeRect.topLeft(), scope);
-    }
 };
 
-static QWidget *scope_card(ProGradeFilter *f, const QString &title, ScopeMode mode)
-{
-    QWidget *box = new QWidget;
-    QVBoxLayout *layout = new QVBoxLayout(box);
-    layout->setContentsMargins(4, 4, 4, 4);
-    QLabel *label = new QLabel(title);
-    label->setAlignment(Qt::AlignCenter);
-    label->setStyleSheet("font-weight:700;font-size:10px;color:#aeb0b7;letter-spacing:0.5px;");
-    layout->addWidget(label);
-    layout->addWidget(new ScopeWidget(f, mode), 1);
-    return box;
-}
-
 static QWidget *wheel_block(ProGradeFilter *f, const QString &title, const char *colorKey,
-                            const char *lumaKey, QColor ProGradeFilter::*colorMember,
-                            double ProGradeFilter::*lumaMember)
+                            const char *lumaKey, std::atomic<uint32_t> ProGradeFilter::*colorMember,
+                            std::atomic<float> ProGradeFilter::*lumaMember)
 {
     QWidget *box = new QWidget;
     QVBoxLayout *layout = new QVBoxLayout(box);
@@ -716,49 +613,40 @@ static QWidget *wheel_block(ProGradeFilter *f, const QString &title, const char 
     label->setStyleSheet("font-weight:700;font-size:12px;letter-spacing:0.5px;");
 
     ColorWheel *wheel = new ColorWheel;
-    {
-        std::lock_guard<std::mutex> lock(f->paramMutex);
-        wheel->value = f->*colorMember;
-    }
-    wheel->changed = [f, colorMember](const QColor &color) {
-        std::lock_guard<std::mutex> lock(f->paramMutex);
-        f->*colorMember = color;
+    wheel->value = (f->*colorMember).load(std::memory_order_relaxed);
+    wheel->interaction = [f](bool active) { f->uiInteracting.store(active, std::memory_order_relaxed); };
+    wheel->changed = [f, colorMember](uint32_t color) {
+        (f->*colorMember).store(color, std::memory_order_relaxed);
     };
-    wheel->committed = [f, colorKey](const QColor &color) { persist_color(f, colorKey, color); };
+    wheel->committed = [f, colorKey](uint32_t color) { persist_color(f, colorKey, color); };
 
     QSlider *slider = new QSlider(Qt::Horizontal);
     slider->setRange(-100, 100);
-    {
-        std::lock_guard<std::mutex> lock(f->paramMutex);
-        slider->setValue(static_cast<int>(std::round((f->*lumaMember) * 100.0)));
-    }
+    slider->setValue(static_cast<int>(std::round((f->*lumaMember).load(std::memory_order_relaxed) * 100.0f)));
 
     QDoubleSpinBox *value = new QDoubleSpinBox;
     value->setDecimals(2);
     value->setRange(-1.0, 1.0);
     value->setSingleStep(0.01);
     value->setButtonSymbols(QAbstractSpinBox::NoButtons);
-    value->setMaximumWidth(65);
+    value->setMaximumWidth(68);
     value->setValue(slider->value() / 100.0);
 
+    QObject::connect(slider, &QSlider::sliderPressed,
+                     [f]() { f->uiInteracting.store(true, std::memory_order_relaxed); });
     QObject::connect(slider, &QSlider::valueChanged, [f, lumaMember, value](int raw) {
-        const double v = raw / 100.0;
-        {
-            std::lock_guard<std::mutex> lock(f->paramMutex);
-            f->*lumaMember = v;
-        }
+        const float v = static_cast<float>(raw) / 100.0f;
+        (f->*lumaMember).store(v, std::memory_order_relaxed);
         value->blockSignals(true);
         value->setValue(v);
         value->blockSignals(false);
     });
     QObject::connect(slider, &QSlider::sliderReleased, [f, lumaKey, slider]() {
         persist_double(f, lumaKey, slider->value() / 100.0);
+        f->uiInteracting.store(false, std::memory_order_relaxed);
     });
     QObject::connect(value, &QDoubleSpinBox::valueChanged, [f, lumaMember, slider](double v) {
-        {
-            std::lock_guard<std::mutex> lock(f->paramMutex);
-            f->*lumaMember = v;
-        }
+        (f->*lumaMember).store(static_cast<float>(v), std::memory_order_relaxed);
         slider->blockSignals(true);
         slider->setValue(static_cast<int>(std::round(v * 100.0)));
         slider->blockSignals(false);
@@ -767,47 +655,43 @@ static QWidget *wheel_block(ProGradeFilter *f, const QString &title, const char 
         persist_double(f, lumaKey, value->value());
     });
 
-    QHBoxLayout *lumaRow = new QHBoxLayout;
-    QLabel *lumaLabel = new QLabel("Y");
-    lumaLabel->setStyleSheet("color:#9a9aa0;");
-    lumaRow->addWidget(lumaLabel);
-    lumaRow->addWidget(slider, 1);
-    lumaRow->addWidget(value);
+    QHBoxLayout *row = new QHBoxLayout;
+    row->addWidget(new QLabel("Y"));
+    row->addWidget(slider, 1);
+    row->addWidget(value);
 
     layout->addWidget(label);
     layout->addWidget(wheel, 0, Qt::AlignCenter);
-    layout->addLayout(lumaRow);
+    layout->addLayout(row);
     return box;
 }
 
-static QWidget *effect_slider(ProGradeFilter *f, const QString &labelText, const char *key,
-                              double ProGradeFilter::*member, int minValue, int maxValue, double scale)
+static QWidget *atomic_slider(ProGradeFilter *f, const QString &labelText, const char *key,
+                              std::atomic<float> ProGradeFilter::*member, int minValue, int maxValue,
+                              float scale)
 {
     QWidget *box = new QWidget;
     QHBoxLayout *row = new QHBoxLayout(box);
     row->setContentsMargins(0, 2, 0, 2);
     QLabel *label = new QLabel(labelText);
-    label->setMinimumWidth(115);
+    label->setMinimumWidth(112);
     QSlider *slider = new QSlider(Qt::Horizontal);
     slider->setRange(minValue, maxValue);
-    {
-        std::lock_guard<std::mutex> lock(f->paramMutex);
-        slider->setValue(static_cast<int>(std::round((f->*member) * scale)));
-    }
+    slider->setValue(static_cast<int>(std::round((f->*member).load(std::memory_order_relaxed) * scale)));
     QLabel *number = new QLabel(QString::number(slider->value() / scale, 'f', 2));
     number->setMinimumWidth(48);
     number->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
+    QObject::connect(slider, &QSlider::sliderPressed,
+                     [f]() { f->uiInteracting.store(true, std::memory_order_relaxed); });
     QObject::connect(slider, &QSlider::valueChanged, [f, member, number, scale](int raw) {
-        const double value = raw / scale;
-        {
-            std::lock_guard<std::mutex> lock(f->paramMutex);
-            f->*member = value;
-        }
+        const float value = static_cast<float>(raw) / scale;
+        (f->*member).store(value, std::memory_order_relaxed);
         number->setText(QString::number(value, 'f', 2));
     });
     QObject::connect(slider, &QSlider::sliderReleased, [f, key, slider, scale]() {
         persist_double(f, key, slider->value() / scale);
+        f->uiInteracting.store(false, std::memory_order_relaxed);
     });
 
     row->addWidget(label);
@@ -822,33 +706,21 @@ static QWidget *lut_block(ProGradeFilter *f, const QString &title, const char *p
 {
     QWidget *box = new QWidget;
     QVBoxLayout *layout = new QVBoxLayout(box);
-    layout->setContentsMargins(6, 6, 6, 6);
-
     QLabel *label = new QLabel(title);
     label->setStyleSheet("font-weight:700;");
     QHBoxLayout *fileRow = new QHBoxLayout;
-    QLineEdit *edit = new QLineEdit;
-    {
-        std::lock_guard<std::mutex> lock(f->paramMutex);
-        edit->setText(QString::fromStdString(f->*pathMember));
-    }
+    QLineEdit *edit = new QLineEdit(QString::fromStdString(f->*pathMember));
     QPushButton *browse = new QPushButton("Browse");
     fileRow->addWidget(edit, 1);
     fileRow->addWidget(browse);
 
     QSlider *mix = new QSlider(Qt::Horizontal);
     mix->setRange(0, 100);
-    {
-        std::lock_guard<std::mutex> lock(f->paramMutex);
-        mix->setValue(static_cast<int>(std::round((f->*mixMember) * 100.0)));
-    }
+    mix->setValue(static_cast<int>(std::round((f->*mixMember) * 100.0)));
 
     auto commitPath = [f, edit, pathKey, pathMember]() {
         const std::string path = edit->text().toUtf8().constData();
-        {
-            std::lock_guard<std::mutex> lock(f->paramMutex);
-            f->*pathMember = path;
-        }
+        f->*pathMember = path;
         obs_data_t *settings = obs_source_get_settings(f->context);
         obs_data_set_string(settings, pathKey, path.c_str());
         obs_source_update(f->context, settings);
@@ -865,12 +737,9 @@ static QWidget *lut_block(ProGradeFilter *f, const QString &title, const char *p
         }
     });
     QObject::connect(edit, &QLineEdit::editingFinished, commitPath);
-    QObject::connect(mix, &QSlider::valueChanged, [f, mixMember](int raw) {
-        std::lock_guard<std::mutex> lock(f->paramMutex);
-        f->*mixMember = raw / 100.0;
-    });
-    QObject::connect(mix, &QSlider::sliderReleased, [f, mixKey, mix]() {
-        persist_double(f, mixKey, mix->value() / 100.0);
+    QObject::connect(mix, &QSlider::sliderReleased, [f, mixKey, mix, mixMember]() {
+        f->*mixMember = mix->value() / 100.0;
+        persist_double(f, mixKey, f->*mixMember);
         ensure_aux_filters(f);
     });
 
@@ -887,13 +756,15 @@ static void show_panel(ProGradeFilter *f)
 {
     if (!f)
         return;
+
     ensure_aux_filters(f);
-    f->scopesEnabled.store(true, std::memory_order_relaxed);
+    f->scopeEnabled.store(true, std::memory_order_relaxed);
+    f->uiInteracting.store(false, std::memory_order_relaxed);
 
     QWidget *parent = static_cast<QWidget *>(obs_frontend_get_main_window());
     QDialog dialog(parent);
-    dialog.setWindowTitle("ProGrade Color 0.3");
-    dialog.resize(1160, 850);
+    dialog.setWindowTitle("ProGrade Color 0.4");
+    dialog.resize(1080, 760);
     dialog.setStyleSheet(
         "QDialog{background:#18191c;color:#eeeeef;}"
         "QWidget{color:#eeeeef;}"
@@ -902,7 +773,6 @@ static void show_panel(ProGradeFilter *f)
         "QTabBar::tab:selected{background:#35363c;}"
         "QLineEdit,QDoubleSpinBox{background:#24252a;border:1px solid #44454c;padding:5px;border-radius:4px;}"
         "QPushButton{background:#2b2c31;border:1px solid #4a4b52;padding:7px 12px;border-radius:4px;}"
-        "QPushButton:hover{background:#393a40;}"
         "QSlider::groove:horizontal{height:4px;background:#3d3e44;border-radius:2px;}"
         "QSlider::handle:horizontal{width:12px;margin:-5px 0;background:#d7d7da;border-radius:6px;}"
     );
@@ -911,7 +781,7 @@ static void show_panel(ProGradeFilter *f)
     QHBoxLayout *header = new QHBoxLayout;
     QLabel *title = new QLabel("PROGRADE");
     title->setStyleSheet("font-weight:800;font-size:18px;letter-spacing:1px;");
-    QLabel *live = new QLabel("● LIGHTWEIGHT REALTIME");
+    QLabel *live = new QLabel("● LOCK-FREE REALTIME");
     live->setStyleSheet("color:#9da0a8;font-size:11px;");
     header->addWidget(title);
     header->addStretch();
@@ -919,81 +789,72 @@ static void show_panel(ProGradeFilter *f)
     root->addLayout(header);
 
     QTabWidget *tabs = new QTabWidget;
+
     QWidget *primaries = new QWidget;
     QVBoxLayout *primLayout = new QVBoxLayout(primaries);
+    QLabel *waveTitle = new QLabel("RGB WAVEFORM  •  LOW-RATE MONITORING");
+    waveTitle->setStyleSheet("font-weight:700;font-size:11px;color:#a9aab0;");
+    WaveformWidget *waveform = new WaveformWidget(f);
+    primLayout->addWidget(waveTitle);
+    primLayout->addWidget(waveform);
 
-    QHBoxLayout *scopeRow = new QHBoxLayout;
-    scopeRow->setSpacing(6);
-    scopeRow->addWidget(scope_card(f, "SOURCE PREVIEW", ScopeMode::Preview), 3);
-    scopeRow->addWidget(scope_card(f, "RGB WAVEFORM", ScopeMode::Waveform), 5);
-    scopeRow->addWidget(scope_card(f, "VECTORSCOPE", ScopeMode::Vectorscope), 3);
-    primLayout->addLayout(scopeRow, 1);
+    QTimer *scopeTimer = new QTimer(&dialog);
+    scopeTimer->setInterval(500);
+    QObject::connect(scopeTimer, &QTimer::timeout, waveform, qOverload<>(&QWidget::update));
+    scopeTimer->start();
 
     QGridLayout *grid = new QGridLayout;
-    grid->setHorizontalSpacing(3);
+    grid->setHorizontalSpacing(2);
     grid->addWidget(wheel_block(f, "LIFT", "lift_color", "lift_luma", &ProGradeFilter::lift,
-                                &ProGradeFilter::liftLuma),
-                    0, 0);
+                                &ProGradeFilter::liftLuma), 0, 0);
     grid->addWidget(wheel_block(f, "GAMMA", "gamma_color", "gamma_luma", &ProGradeFilter::gamma,
-                                &ProGradeFilter::gammaLuma),
-                    0, 1);
+                                &ProGradeFilter::gammaLuma), 0, 1);
     grid->addWidget(wheel_block(f, "GAIN", "gain_color", "gain_luma", &ProGradeFilter::gain,
-                                &ProGradeFilter::gainLuma),
-                    0, 2);
+                                &ProGradeFilter::gainLuma), 0, 2);
     grid->addWidget(wheel_block(f, "OFFSET", "offset_color", "offset_luma", &ProGradeFilter::offset,
-                                &ProGradeFilter::offsetLuma),
-                    0, 3);
-    primLayout->addLayout(grid, 2);
-    primLayout->addWidget(
-        effect_slider(f, "Saturation", "saturation", &ProGradeFilter::saturation, 0, 200, 100.0));
-    tabs->addTab(primaries, "Primaries + Scopes");
+                                &ProGradeFilter::offsetLuma), 0, 3);
+    primLayout->addLayout(grid);
+    primLayout->addWidget(atomic_slider(f, "Saturation", "saturation", &ProGradeFilter::saturation,
+                                        0, 200, 100.0f));
+    tabs->addTab(primaries, "Primaries");
 
     QWidget *film = new QWidget;
     QVBoxLayout *filmLayout = new QVBoxLayout(film);
     QLabel *bloomTitle = new QLabel("BLOOM");
     bloomTitle->setStyleSheet("font-weight:800;font-size:13px;");
     filmLayout->addWidget(bloomTitle);
-    filmLayout->addWidget(
-        effect_slider(f, "Strength", "bloom_strength", &ProGradeFilter::bloomStrength, 0, 100, 100.0));
-    filmLayout->addWidget(effect_slider(f, "Threshold", "bloom_threshold", &ProGradeFilter::bloomThreshold,
-                                        0, 100, 100.0));
-    filmLayout->addWidget(
-        effect_slider(f, "Radius", "bloom_radius", &ProGradeFilter::bloomRadius, 0, 300, 10.0));
+    filmLayout->addWidget(atomic_slider(f, "Strength", "bloom_strength", &ProGradeFilter::bloomStrength,
+                                        0, 100, 100.0f));
+    filmLayout->addWidget(atomic_slider(f, "Threshold", "bloom_threshold", &ProGradeFilter::bloomThreshold,
+                                        0, 100, 100.0f));
+    filmLayout->addWidget(atomic_slider(f, "Radius", "bloom_radius", &ProGradeFilter::bloomRadius,
+                                        0, 300, 10.0f));
     QLabel *halTitle = new QLabel("HALATION");
     halTitle->setStyleSheet("font-weight:800;font-size:13px;margin-top:12px;");
     filmLayout->addWidget(halTitle);
-    filmLayout->addWidget(effect_slider(f, "Strength", "halation_strength", &ProGradeFilter::halationStrength,
-                                        0, 100, 100.0));
-    filmLayout->addWidget(effect_slider(f, "Threshold", "halation_threshold", &ProGradeFilter::halationThreshold,
-                                        0, 100, 100.0));
-    filmLayout->addWidget(
-        effect_slider(f, "Radius", "halation_radius", &ProGradeFilter::halationRadius, 0, 200, 10.0));
-    QLabel *filmInfo = new QLabel(
-        "Fast 5-tap GPU blur. At zero strength both effects are bypassed entirely by the shader.");
-    filmInfo->setWordWrap(true);
-    filmInfo->setStyleSheet("color:#9b9ca2;margin-top:12px;");
-    filmLayout->addWidget(filmInfo);
+    filmLayout->addWidget(atomic_slider(f, "Strength", "halation_strength", &ProGradeFilter::halationStrength,
+                                        0, 100, 100.0f));
+    filmLayout->addWidget(atomic_slider(f, "Threshold", "halation_threshold", &ProGradeFilter::halationThreshold,
+                                        0, 100, 100.0f));
+    filmLayout->addWidget(atomic_slider(f, "Radius", "halation_radius", &ProGradeFilter::halationRadius,
+                                        0, 200, 10.0f));
     filmLayout->addStretch();
     tabs->addTab(film, "Film Effects");
 
     QWidget *pipeline = new QWidget;
     QVBoxLayout *pipeLayout = new QVBoxLayout(pipeline);
-    QLabel *chain = new QLabel("CST / TECHNICAL TRANSFORM  →  PRIMARIES  →  BLOOM / HALATION  →  LUT 1  →  LUT 2");
+    QLabel *chain = new QLabel("CST  →  PRIMARIES  →  FILM EFFECTS  →  LUT 1  →  LUT 2");
     chain->setStyleSheet("font-weight:700;color:#b8b9bf;padding:6px;");
     pipeLayout->addWidget(chain);
     pipeLayout->addWidget(lut_block(f, "CST / CAMERA → REC.709", "cst_path", "cst_mix",
                                     &ProGradeFilter::cstPath, &ProGradeFilter::cstMix));
-    QLabel *cstInfo = new QLabel(
-        "Technical camera transform only. Creative looks remain in the two slots below.");
-    cstInfo->setWordWrap(true);
-    cstInfo->setStyleSheet("color:#9b9ca2;padding:0 8px 8px 8px;");
-    pipeLayout->addWidget(cstInfo);
     pipeLayout->addWidget(lut_block(f, "CREATIVE LUT 1", "lut1_path", "lut1_mix",
                                     &ProGradeFilter::lut1Path, &ProGradeFilter::lut1Mix));
     pipeLayout->addWidget(lut_block(f, "CREATIVE LUT 2", "lut2_path", "lut2_mix",
                                     &ProGradeFilter::lut2Path, &ProGradeFilter::lut2Mix));
     pipeLayout->addStretch();
     tabs->addTab(pipeline, "CST & LUTs");
+
     root->addWidget(tabs, 1);
 
     QHBoxLayout *buttons = new QHBoxLayout;
@@ -1018,14 +879,14 @@ static void show_panel(ProGradeFilter *f)
         obs_source_update(f->context, settings);
         obs_data_release(settings);
         dialog.accept();
-        f->scopesEnabled.store(false, std::memory_order_relaxed);
-        show_panel(f);
     });
     QObject::connect(close, &QPushButton::clicked, &dialog, &QDialog::accept);
-    root->addLayout(buttons);
 
+    root->addLayout(buttons);
     dialog.exec();
-    f->scopesEnabled.store(false, std::memory_order_relaxed);
+
+    f->uiInteracting.store(false, std::memory_order_relaxed);
+    f->scopeEnabled.store(false, std::memory_order_relaxed);
 }
 
 static const char *filter_name(void *)
@@ -1039,33 +900,28 @@ static void filter_update(void *data, obs_data_t *settings)
     if (!f)
         return;
 
-    {
-        std::lock_guard<std::mutex> lock(f->paramMutex);
-        f->lift = color_from_obs(settings, "lift_color");
-        f->gamma = color_from_obs(settings, "gamma_color");
-        f->gain = color_from_obs(settings, "gain_color");
-        f->offset = color_from_obs(settings, "offset_color");
-        f->liftLuma = obs_data_get_double(settings, "lift_luma");
-        f->gammaLuma = obs_data_get_double(settings, "gamma_luma");
-        f->gainLuma = obs_data_get_double(settings, "gain_luma");
-        f->offsetLuma = obs_data_get_double(settings, "offset_luma");
-        f->saturation = obs_data_get_double(settings, "saturation");
-        f->bloomThreshold = obs_data_get_double(settings, "bloom_threshold");
-        f->bloomRadius = obs_data_get_double(settings, "bloom_radius");
-        f->bloomStrength = obs_data_get_double(settings, "bloom_strength");
-        f->halationThreshold = obs_data_get_double(settings, "halation_threshold");
-        f->halationRadius = obs_data_get_double(settings, "halation_radius");
-        f->halationStrength = obs_data_get_double(settings, "halation_strength");
-        f->cstPath = obs_data_get_string(settings, "cst_path");
-        f->cstMix = obs_data_get_double(settings, "cst_mix");
-        f->lut1Path = obs_data_get_string(settings, "lut1_path");
-        f->lut2Path = obs_data_get_string(settings, "lut2_path");
-        f->lut1Mix = obs_data_get_double(settings, "lut1_mix");
-        f->lut2Mix = obs_data_get_double(settings, "lut2_mix");
-    }
+    f->lift.store(static_cast<uint32_t>(obs_data_get_int(settings, "lift_color")), std::memory_order_relaxed);
+    f->gamma.store(static_cast<uint32_t>(obs_data_get_int(settings, "gamma_color")), std::memory_order_relaxed);
+    f->gain.store(static_cast<uint32_t>(obs_data_get_int(settings, "gain_color")), std::memory_order_relaxed);
+    f->offset.store(static_cast<uint32_t>(obs_data_get_int(settings, "offset_color")), std::memory_order_relaxed);
+    f->liftLuma.store(static_cast<float>(obs_data_get_double(settings, "lift_luma")), std::memory_order_relaxed);
+    f->gammaLuma.store(static_cast<float>(obs_data_get_double(settings, "gamma_luma")), std::memory_order_relaxed);
+    f->gainLuma.store(static_cast<float>(obs_data_get_double(settings, "gain_luma")), std::memory_order_relaxed);
+    f->offsetLuma.store(static_cast<float>(obs_data_get_double(settings, "offset_luma")), std::memory_order_relaxed);
+    f->saturation.store(static_cast<float>(obs_data_get_double(settings, "saturation")), std::memory_order_relaxed);
+    f->bloomThreshold.store(static_cast<float>(obs_data_get_double(settings, "bloom_threshold")), std::memory_order_relaxed);
+    f->bloomRadius.store(static_cast<float>(obs_data_get_double(settings, "bloom_radius")), std::memory_order_relaxed);
+    f->bloomStrength.store(static_cast<float>(obs_data_get_double(settings, "bloom_strength")), std::memory_order_relaxed);
+    f->halationThreshold.store(static_cast<float>(obs_data_get_double(settings, "halation_threshold")), std::memory_order_relaxed);
+    f->halationRadius.store(static_cast<float>(obs_data_get_double(settings, "halation_radius")), std::memory_order_relaxed);
+    f->halationStrength.store(static_cast<float>(obs_data_get_double(settings, "halation_strength")), std::memory_order_relaxed);
 
-    if (f->cst || f->lut1 || f->lut2)
-        ensure_aux_filters(f);
+    f->cstPath = obs_data_get_string(settings, "cst_path");
+    f->cstMix = obs_data_get_double(settings, "cst_mix");
+    f->lut1Path = obs_data_get_string(settings, "lut1_path");
+    f->lut2Path = obs_data_get_string(settings, "lut2_path");
+    f->lut1Mix = obs_data_get_double(settings, "lut1_mix");
+    f->lut2Mix = obs_data_get_double(settings, "lut2_mix");
 }
 
 static void filter_defaults(obs_data_t *settings)
@@ -1104,7 +960,7 @@ static obs_properties_t *filter_properties(void *)
 {
     obs_properties_t *props = obs_properties_create();
     obs_properties_add_text(props, "info",
-                            "ProGrade 0.3: cached wheels, lightweight embedded scopes, GPU primaries, CST, bloom, halation and dual LUTs.",
+                            "ProGrade 0.4: lock-free realtime primaries, CST, film effects, dual LUT and ultra-light RGB waveform.",
                             OBS_TEXT_INFO);
     obs_properties_add_button(props, "open_panel", "Open ProGrade Color", open_panel_button);
     return props;
@@ -1114,7 +970,6 @@ static void *filter_create(obs_data_t *settings, obs_source_t *context)
 {
     auto *f = new ProGradeFilter;
     f->context = context;
-    f->scopePixels.reserve(static_cast<size_t>(SCOPE_W) * SCOPE_H);
 
     obs_enter_graphics();
     f->effect = gs_effect_create(effect_text, "prograde.effect", nullptr);
@@ -1163,7 +1018,6 @@ static void filter_destroy(void *data)
     if (!f)
         return;
 
-    f->scopesEnabled.store(false, std::memory_order_relaxed);
     release_aux_filter(f->parent, f->cst);
     release_aux_filter(f->parent, f->lut1);
     release_aux_filter(f->parent, f->lut2);
@@ -1184,6 +1038,8 @@ static void filter_add(void *data, obs_source_t *source)
     if (f->parent)
         obs_source_release(f->parent);
     f->parent = obs_source_get_ref(source);
+    f->cachedWidth = std::max(1u, obs_source_get_base_width(source));
+    f->cachedHeight = std::max(1u, obs_source_get_base_height(source));
 }
 
 static void filter_remove(void *data, obs_source_t *source)
@@ -1210,74 +1066,38 @@ static void filter_render(void *data, gs_effect_t *)
         return;
     }
 
-    if (f->scopesEnabled.load(std::memory_order_relaxed)) {
-        ++f->scopeFrameCounter;
-        if ((f->scopeFrameCounter & 7u) == 0u)
-            capture_scope_frame(f);
-    }
-
     if (!obs_source_process_filter_begin(f->context, GS_RGBA, OBS_NO_DIRECT_RENDERING))
         return;
 
-    QColor lift;
-    QColor gamma;
-    QColor gain;
-    QColor offset;
-    double liftLuma;
-    double gammaLuma;
-    double gainLuma;
-    double offsetLuma;
-    double saturation;
-    double bloomThreshold;
-    double bloomRadius;
-    double bloomStrength;
-    double halationThreshold;
-    double halationRadius;
-    double halationStrength;
+    set_bias(f->pLift, f->lift.load(std::memory_order_relaxed));
+    gs_effect_set_float(f->pLiftLuma, f->liftLuma.load(std::memory_order_relaxed));
+    set_bias(f->pGamma, f->gamma.load(std::memory_order_relaxed));
+    gs_effect_set_float(f->pGammaLuma, f->gammaLuma.load(std::memory_order_relaxed));
+    set_bias(f->pGain, f->gain.load(std::memory_order_relaxed));
+    gs_effect_set_float(f->pGainLuma, f->gainLuma.load(std::memory_order_relaxed));
+    set_bias(f->pOffset, f->offset.load(std::memory_order_relaxed));
+    gs_effect_set_float(f->pOffsetLuma, f->offsetLuma.load(std::memory_order_relaxed));
+    gs_effect_set_float(f->pSaturation, f->saturation.load(std::memory_order_relaxed));
 
-    {
-        std::lock_guard<std::mutex> lock(f->paramMutex);
-        lift = f->lift;
-        gamma = f->gamma;
-        gain = f->gain;
-        offset = f->offset;
-        liftLuma = f->liftLuma;
-        gammaLuma = f->gammaLuma;
-        gainLuma = f->gainLuma;
-        offsetLuma = f->offsetLuma;
-        saturation = f->saturation;
-        bloomThreshold = f->bloomThreshold;
-        bloomRadius = f->bloomRadius;
-        bloomStrength = f->bloomStrength;
-        halationThreshold = f->halationThreshold;
-        halationRadius = f->halationRadius;
-        halationStrength = f->halationStrength;
-    }
-
-    set_bias(f->pLift, lift);
-    gs_effect_set_float(f->pLiftLuma, static_cast<float>(liftLuma));
-    set_bias(f->pGamma, gamma);
-    gs_effect_set_float(f->pGammaLuma, static_cast<float>(gammaLuma));
-    set_bias(f->pGain, gain);
-    gs_effect_set_float(f->pGainLuma, static_cast<float>(gainLuma));
-    set_bias(f->pOffset, offset);
-    gs_effect_set_float(f->pOffsetLuma, static_cast<float>(offsetLuma));
-    gs_effect_set_float(f->pSaturation, static_cast<float>(saturation));
-
-    const uint32_t width = f->parent ? obs_source_get_base_width(f->parent) : 1920;
-    const uint32_t height = f->parent ? obs_source_get_base_height(f->parent) : 1080;
     vec2 texel;
-    vec2_set(&texel, width > 0 ? 1.0f / static_cast<float>(width) : 0.0f,
-             height > 0 ? 1.0f / static_cast<float>(height) : 0.0f);
+    vec2_set(&texel, 1.0f / static_cast<float>(f->cachedWidth), 1.0f / static_cast<float>(f->cachedHeight));
     gs_effect_set_vec2(f->pTexelSize, &texel);
-    gs_effect_set_float(f->pBloomThreshold, static_cast<float>(bloomThreshold));
-    gs_effect_set_float(f->pBloomRadius, static_cast<float>(bloomRadius));
-    gs_effect_set_float(f->pBloomStrength, static_cast<float>(bloomStrength));
-    gs_effect_set_float(f->pHalationThreshold, static_cast<float>(halationThreshold));
-    gs_effect_set_float(f->pHalationRadius, static_cast<float>(halationRadius));
-    gs_effect_set_float(f->pHalationStrength, static_cast<float>(halationStrength));
+    gs_effect_set_float(f->pBloomThreshold, f->bloomThreshold.load(std::memory_order_relaxed));
+    gs_effect_set_float(f->pBloomRadius, f->bloomRadius.load(std::memory_order_relaxed));
+    gs_effect_set_float(f->pBloomStrength, f->bloomStrength.load(std::memory_order_relaxed));
+    gs_effect_set_float(f->pHalationThreshold, f->halationThreshold.load(std::memory_order_relaxed));
+    gs_effect_set_float(f->pHalationRadius, f->halationRadius.load(std::memory_order_relaxed));
+    gs_effect_set_float(f->pHalationStrength, f->halationStrength.load(std::memory_order_relaxed));
 
     obs_source_process_filter_end(f->context, f->effect, 0, 0);
+
+    if (f->scopeEnabled.load(std::memory_order_relaxed) && !f->uiInteracting.load(std::memory_order_relaxed)) {
+        ++f->scopeFrameCounter;
+        if (f->scopeFrameCounter >= SCOPE_INTERVAL_FRAMES) {
+            f->scopeFrameCounter = 0;
+            capture_waveform_samples(f);
+        }
+    }
 }
 
 bool obs_module_load(void)
@@ -1296,6 +1116,6 @@ bool obs_module_load(void)
     info.filter_add = filter_add;
     info.filter_remove = filter_remove;
     obs_register_source(&info);
-    blog(LOG_INFO, "[ProGrade] 0.3 loaded: cached wheels, embedded scopes, optimized GPU effects");
+    blog(LOG_INFO, "[ProGrade] 0.4 loaded: lock-free render path + low-rate RGB waveform");
     return true;
 }
