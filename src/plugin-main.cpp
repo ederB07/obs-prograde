@@ -9,6 +9,7 @@
 #include <QFileDialog>
 #include <QGridLayout>
 #include <QHBoxLayout>
+#include <QImage>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMouseEvent>
@@ -16,24 +17,30 @@
 #include <QPushButton>
 #include <QSlider>
 #include <QTabWidget>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <string>
+#include <vector>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-prograde", "en-US")
 
 MODULE_EXPORT const char *obs_module_description(void)
 {
-    return "ProGrade: realtime GPU color grading, CST, bloom, halation and dual LUT";
+    return "ProGrade: lightweight realtime GPU color grading with embedded scopes";
 }
 
 static const char *FILTER_ID = "prograde_filter";
+static constexpr int SCOPE_W = 320;
+static constexpr int SCOPE_H = 180;
 
 struct ProGradeFilter {
     obs_source_t *context = nullptr;
@@ -84,6 +91,12 @@ struct ProGradeFilter {
     std::string lut2Path;
     double lut1Mix = 1.0;
     double lut2Mix = 1.0;
+
+    std::atomic<bool> scopesEnabled{false};
+    uint32_t scopeFrameCounter = 0;
+    std::mutex scopeMutex;
+    std::vector<uint32_t> scopePixels;
+    bool scopeValid = false;
 };
 
 static const char *effect_text = R"(
@@ -142,18 +155,14 @@ float highlight_mask(float3 c, float threshold)
     return smoothstep(threshold, min(1.0, threshold + 0.18), m);
 }
 
-float3 blur_cross(float2 uv, float radius)
+float3 blur_fast(float2 uv, float radius)
 {
-    float2 s = texel_size * radius;
-    float3 sum = image.Sample(textureSampler, uv).rgb * 0.20;
-    sum += image.Sample(textureSampler, uv + float2(s.x, 0.0)).rgb * 0.12;
-    sum += image.Sample(textureSampler, uv - float2(s.x, 0.0)).rgb * 0.12;
-    sum += image.Sample(textureSampler, uv + float2(0.0, s.y)).rgb * 0.12;
-    sum += image.Sample(textureSampler, uv - float2(0.0, s.y)).rgb * 0.12;
-    sum += image.Sample(textureSampler, uv + s).rgb * 0.08;
-    sum += image.Sample(textureSampler, uv - s).rgb * 0.08;
-    sum += image.Sample(textureSampler, uv + float2(s.x, -s.y)).rgb * 0.08;
-    sum += image.Sample(textureSampler, uv + float2(-s.x, s.y)).rgb * 0.08;
+    float2 s = texel_size * max(0.5, radius);
+    float3 sum = image.Sample(textureSampler, uv).rgb * 0.40;
+    sum += image.Sample(textureSampler, uv + s).rgb * 0.15;
+    sum += image.Sample(textureSampler, uv - s).rgb * 0.15;
+    sum += image.Sample(textureSampler, uv + float2(s.x, -s.y)).rgb * 0.15;
+    sum += image.Sample(textureSampler, uv + float2(-s.x, s.y)).rgb * 0.15;
     return sum;
 }
 
@@ -170,7 +179,6 @@ float4 PSProGrade(VertData v_in) : TARGET
 
     c += offset_luma * 0.32;
     c += offset_color * 0.32;
-
     c += shadow * lift_luma * 0.28;
     c += shadow * lift_color * 0.32;
 
@@ -184,14 +192,14 @@ float4 PSProGrade(VertData v_in) : TARGET
     c = sat_adjust(c, saturation);
 
     if (bloom_strength > 0.0001) {
-        float3 b = blur_cross(v_in.uv, max(0.5, bloom_radius));
+        float3 b = blur_fast(v_in.uv, bloom_radius);
         float mask = highlight_mask(b, bloom_threshold);
         float3 glow = b * mask * bloom_strength;
         c = 1.0 - (1.0 - saturate(c)) * (1.0 - saturate(glow));
     }
 
     if (halation_strength > 0.0001) {
-        float3 h = blur_cross(v_in.uv, max(0.5, halation_radius));
+        float3 h = blur_fast(v_in.uv, halation_radius);
         float mask = highlight_mask(h, halation_threshold);
         float redHalo = h.r * mask * halation_strength;
         c += float3(redHalo, redHalo * 0.10, redHalo * 0.025);
@@ -209,6 +217,133 @@ technique Draw
     }
 }
 )";
+
+static inline uint8_t clamp_byte(float v)
+{
+    return static_cast<uint8_t>(std::clamp(v, 0.0f, 255.0f));
+}
+
+static void yuv_to_rgb(uint8_t yv, uint8_t uv, uint8_t vv, bool full, uint8_t &r, uint8_t &g, uint8_t &b)
+{
+    float y;
+    float u;
+    float v;
+    if (full) {
+        y = static_cast<float>(yv);
+        u = static_cast<float>(uv) - 128.0f;
+        v = static_cast<float>(vv) - 128.0f;
+        r = clamp_byte(y + 1.5748f * v);
+        g = clamp_byte(y - 0.1873f * u - 0.4681f * v);
+        b = clamp_byte(y + 1.8556f * u);
+    } else {
+        y = 1.16438f * (static_cast<float>(yv) - 16.0f);
+        u = static_cast<float>(uv) - 128.0f;
+        v = static_cast<float>(vv) - 128.0f;
+        r = clamp_byte(y + 1.79274f * v);
+        g = clamp_byte(y - 0.21325f * u - 0.53291f * v);
+        b = clamp_byte(y + 2.11240f * u);
+    }
+}
+
+static bool read_frame_rgb(const obs_source_frame *frame, uint32_t x, uint32_t y, uint8_t &r, uint8_t &g,
+                           uint8_t &b)
+{
+    if (!frame || x >= frame->width || y >= frame->height)
+        return false;
+
+    switch (frame->format) {
+    case VIDEO_FORMAT_BGRA:
+    case VIDEO_FORMAT_BGRX: {
+        const uint8_t *p = frame->data[0] + y * frame->linesize[0] + x * 4;
+        b = p[0];
+        g = p[1];
+        r = p[2];
+        return true;
+    }
+    case VIDEO_FORMAT_RGBA: {
+        const uint8_t *p = frame->data[0] + y * frame->linesize[0] + x * 4;
+        r = p[0];
+        g = p[1];
+        b = p[2];
+        return true;
+    }
+    case VIDEO_FORMAT_NV12: {
+        const uint8_t yy = frame->data[0][y * frame->linesize[0] + x];
+        const uint8_t *uv = frame->data[1] + (y / 2) * frame->linesize[1] + (x / 2) * 2;
+        yuv_to_rgb(yy, uv[0], uv[1], frame->full_range, r, g, b);
+        return true;
+    }
+    case VIDEO_FORMAT_I420: {
+        const uint8_t yy = frame->data[0][y * frame->linesize[0] + x];
+        const uint8_t uu = frame->data[1][(y / 2) * frame->linesize[1] + (x / 2)];
+        const uint8_t vv = frame->data[2][(y / 2) * frame->linesize[2] + (x / 2)];
+        yuv_to_rgb(yy, uu, vv, frame->full_range, r, g, b);
+        return true;
+    }
+    case VIDEO_FORMAT_YUY2: {
+        const uint8_t *p = frame->data[0] + y * frame->linesize[0] + (x / 2) * 4;
+        const uint8_t yy = (x & 1) ? p[2] : p[0];
+        yuv_to_rgb(yy, p[1], p[3], frame->full_range, r, g, b);
+        return true;
+    }
+    case VIDEO_FORMAT_UYVY: {
+        const uint8_t *p = frame->data[0] + y * frame->linesize[0] + (x / 2) * 4;
+        const uint8_t yy = (x & 1) ? p[3] : p[1];
+        yuv_to_rgb(yy, p[0], p[2], frame->full_range, r, g, b);
+        return true;
+    }
+    case VIDEO_FORMAT_YVYU: {
+        const uint8_t *p = frame->data[0] + y * frame->linesize[0] + (x / 2) * 4;
+        const uint8_t yy = (x & 1) ? p[2] : p[0];
+        yuv_to_rgb(yy, p[3], p[1], frame->full_range, r, g, b);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+static void capture_scope_frame(ProGradeFilter *f)
+{
+    if (!f || !f->parent || !f->scopesEnabled.load(std::memory_order_relaxed))
+        return;
+
+    const uint32_t flags = obs_source_get_output_flags(f->parent);
+    if ((flags & OBS_SOURCE_ASYNC_VIDEO) == 0)
+        return;
+
+    obs_source_frame *frame = obs_source_get_frame(f->parent);
+    if (!frame)
+        return;
+
+    std::vector<uint32_t> pixels(static_cast<size_t>(SCOPE_W) * SCOPE_H);
+    bool valid = true;
+    for (int sy = 0; sy < SCOPE_H && valid; ++sy) {
+        const uint32_t srcY = std::min(frame->height - 1,
+                                       static_cast<uint32_t>((static_cast<uint64_t>(sy) * frame->height) / SCOPE_H));
+        for (int sx = 0; sx < SCOPE_W; ++sx) {
+            const uint32_t srcX = std::min(frame->width - 1,
+                                           static_cast<uint32_t>((static_cast<uint64_t>(sx) * frame->width) / SCOPE_W));
+            uint8_t r = 0;
+            uint8_t g = 0;
+            uint8_t b = 0;
+            if (!read_frame_rgb(frame, srcX, srcY, r, g, b)) {
+                valid = false;
+                break;
+            }
+            pixels[static_cast<size_t>(sy) * SCOPE_W + sx] =
+                0xff000000u | (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8) |
+                static_cast<uint32_t>(b);
+        }
+    }
+    obs_source_release_frame(f->parent, frame);
+
+    if (valid) {
+        std::lock_guard<std::mutex> lock(f->scopeMutex);
+        f->scopePixels.swap(pixels);
+        f->scopeValid = true;
+    }
+}
 
 static QColor color_from_obs(obs_data_t *settings, const char *key)
 {
@@ -310,9 +445,8 @@ public:
 
     explicit ColorWheel(QWidget *parent = nullptr) : QWidget(parent)
     {
-        setMinimumSize(190, 190);
-        setMaximumSize(230, 230);
-        setMouseTracking(true);
+        setMinimumSize(176, 176);
+        setMaximumSize(210, 210);
     }
 
 protected:
@@ -321,29 +455,12 @@ protected:
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing, true);
         const int side = std::min(width(), height()) - 16;
+        ensureWheelCache(side);
         QRectF rect((width() - side) / 2.0, (height() - side) / 2.0, side, side);
         const QPointF center = rect.center();
         const double radius = rect.width() / 2.0;
 
-        QImage wheel(static_cast<int>(rect.width()), static_cast<int>(rect.height()),
-                     QImage::Format_ARGB32_Premultiplied);
-        wheel.fill(Qt::transparent);
-        for (int y = 0; y < wheel.height(); ++y) {
-            for (int x = 0; x < wheel.width(); ++x) {
-                const double dx = x - wheel.width() / 2.0;
-                const double dy = y - wheel.height() / 2.0;
-                const double rr = std::sqrt(dx * dx + dy * dy) / radius;
-                if (rr <= 1.0) {
-                    const double ang = std::atan2(-dy, dx);
-                    const double hue = std::fmod(ang / (2.0 * M_PI) + 1.0, 1.0);
-                    QColor col;
-                    col.setHsvF(static_cast<float>(hue), static_cast<float>(std::min(1.0, rr)), 0.90f);
-                    wheel.setPixelColor(x, y, col);
-                }
-            }
-        }
-        p.drawImage(rect.topLeft(), wheel);
-
+        p.drawImage(rect.topLeft(), wheelCache);
         p.setPen(QPen(QColor(20, 20, 22), 5));
         p.setBrush(Qt::NoBrush);
         p.drawEllipse(rect.adjusted(1, 1, -1, -1));
@@ -383,6 +500,35 @@ protected:
     }
 
 private:
+    QImage wheelCache;
+    int cachedSide = 0;
+
+    void ensureWheelCache(int side)
+    {
+        if (cachedSide == side && !wheelCache.isNull())
+            return;
+
+        cachedSide = side;
+        wheelCache = QImage(side, side, QImage::Format_ARGB32_Premultiplied);
+        wheelCache.fill(Qt::transparent);
+        const double radius = side / 2.0;
+        for (int y = 0; y < side; ++y) {
+            QRgb *line = reinterpret_cast<QRgb *>(wheelCache.scanLine(y));
+            for (int x = 0; x < side; ++x) {
+                const double dx = x - side / 2.0;
+                const double dy = y - side / 2.0;
+                const double rr = std::sqrt(dx * dx + dy * dy) / radius;
+                if (rr > 1.0)
+                    continue;
+                const double ang = std::atan2(-dy, dx);
+                const double hue = std::fmod(ang / (2.0 * M_PI) + 1.0, 1.0);
+                QColor col;
+                col.setHsvF(static_cast<float>(hue), static_cast<float>(std::min(1.0, rr)), 0.90f);
+                line[x] = col.rgba();
+            }
+        }
+    }
+
     void setFromPoint(const QPointF &point)
     {
         const int side = std::min(width(), height()) - 16;
@@ -402,13 +548,168 @@ private:
     }
 };
 
+enum class ScopeMode { Preview, Waveform, Vectorscope };
+
+class ScopeWidget : public QWidget {
+public:
+    ScopeWidget(ProGradeFilter *filter, ScopeMode m, QWidget *parent = nullptr) : QWidget(parent), f(filter), mode(m)
+    {
+        setMinimumSize(mode == ScopeMode::Waveform ? 340 : 220, 130);
+        timer.setInterval(125);
+        QObject::connect(&timer, &QTimer::timeout, this, QOverload<>::of(&ScopeWidget::update));
+        timer.start();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter painter(this);
+        painter.fillRect(rect(), QColor(8, 9, 11));
+        painter.setRenderHint(QPainter::Antialiasing, false);
+
+        std::vector<uint32_t> pixels;
+        bool valid = false;
+        {
+            std::lock_guard<std::mutex> lock(f->scopeMutex);
+            valid = f->scopeValid && f->scopePixels.size() == static_cast<size_t>(SCOPE_W) * SCOPE_H;
+            if (valid)
+                pixels = f->scopePixels;
+        }
+
+        if (!valid) {
+            painter.setPen(QColor(125, 127, 135));
+            painter.drawText(rect(), Qt::AlignCenter | Qt::TextWordWrap,
+                             "Scope preview unavailable for this source format");
+            return;
+        }
+
+        if (mode == ScopeMode::Preview)
+            drawPreview(painter, pixels);
+        else if (mode == ScopeMode::Waveform)
+            drawWaveform(painter, pixels);
+        else
+            drawVectorscope(painter, pixels);
+    }
+
+private:
+    ProGradeFilter *f;
+    ScopeMode mode;
+    QTimer timer;
+
+    static inline uint8_t red(uint32_t p) { return static_cast<uint8_t>((p >> 16) & 0xff); }
+    static inline uint8_t green(uint32_t p) { return static_cast<uint8_t>((p >> 8) & 0xff); }
+    static inline uint8_t blue(uint32_t p) { return static_cast<uint8_t>(p & 0xff); }
+
+    void drawPreview(QPainter &p, const std::vector<uint32_t> &pixels)
+    {
+        QImage image(reinterpret_cast<const uchar *>(pixels.data()), SCOPE_W, SCOPE_H, SCOPE_W * 4,
+                     QImage::Format_ARGB32);
+        const QRect target = QRect(QPoint(0, 0), size()).adjusted(4, 4, -4, -4);
+        const QImage scaled = image.scaled(target.size(), Qt::KeepAspectRatio, Qt::FastTransformation);
+        const QPoint pos((width() - scaled.width()) / 2, (height() - scaled.height()) / 2);
+        p.drawImage(pos, scaled);
+    }
+
+    void drawGrid(QPainter &p)
+    {
+        p.setPen(QColor(38, 40, 45));
+        for (int i = 1; i < 4; ++i) {
+            const int y = i * height() / 4;
+            p.drawLine(0, y, width(), y);
+        }
+        p.setPen(QColor(83, 85, 92));
+        p.drawRect(rect().adjusted(0, 0, -1, -1));
+    }
+
+    void drawWaveform(QPainter &p, const std::vector<uint32_t> &pixels)
+    {
+        drawGrid(p);
+        const int w = std::max(1, width() - 2);
+        const int h = std::max(1, height() - 2);
+        QImage scope(w, h, QImage::Format_ARGB32);
+        scope.fill(Qt::transparent);
+
+        auto addPoint = [&scope, w, h](int x, int y, int channel) {
+            if (x < 0 || x >= w || y < 0 || y >= h)
+                return;
+            QRgb *line = reinterpret_cast<QRgb *>(scope.scanLine(y));
+            QColor old = QColor::fromRgba(line[x]);
+            int r = old.red();
+            int g = old.green();
+            int b = old.blue();
+            if (channel == 0)
+                r = std::min(255, r + 90);
+            else if (channel == 1)
+                g = std::min(255, g + 90);
+            else
+                b = std::min(255, b + 90);
+            line[x] = qRgba(r, g, b, std::max(150, old.alpha()));
+        };
+
+        for (int sy = 0; sy < SCOPE_H; sy += 3) {
+            for (int sx = 0; sx < SCOPE_W; sx += 2) {
+                const uint32_t px = pixels[static_cast<size_t>(sy) * SCOPE_W + sx];
+                const int x = sx * (w - 1) / (SCOPE_W - 1);
+                addPoint(x, (255 - red(px)) * (h - 1) / 255, 0);
+                addPoint(x, (255 - green(px)) * (h - 1) / 255, 1);
+                addPoint(x, (255 - blue(px)) * (h - 1) / 255, 2);
+            }
+        }
+        p.drawImage(1, 1, scope);
+    }
+
+    void drawVectorscope(QPainter &p, const std::vector<uint32_t> &pixels)
+    {
+        const int side = std::min(width(), height()) - 8;
+        const QRect scopeRect((width() - side) / 2, (height() - side) / 2, side, side);
+        p.setPen(QColor(52, 54, 60));
+        p.drawEllipse(scopeRect);
+        p.drawLine(scopeRect.center().x(), scopeRect.top(), scopeRect.center().x(), scopeRect.bottom());
+        p.drawLine(scopeRect.left(), scopeRect.center().y(), scopeRect.right(), scopeRect.center().y());
+
+        QImage scope(side, side, QImage::Format_ARGB32);
+        scope.fill(Qt::transparent);
+        for (int sy = 0; sy < SCOPE_H; sy += 3) {
+            for (int sx = 0; sx < SCOPE_W; sx += 3) {
+                const uint32_t px = pixels[static_cast<size_t>(sy) * SCOPE_W + sx];
+                const float rf = red(px) / 255.0f;
+                const float gf = green(px) / 255.0f;
+                const float bf = blue(px) / 255.0f;
+                const float y = 0.2126f * rf + 0.7152f * gf + 0.0722f * bf;
+                const float u = (bf - y) * 0.5389f;
+                const float v = (rf - y) * 0.6350f;
+                const int x = std::clamp(static_cast<int>((0.5f + u) * (side - 1)), 0, side - 1);
+                const int yy = std::clamp(static_cast<int>((0.5f - v) * (side - 1)), 0, side - 1);
+                QRgb *line = reinterpret_cast<QRgb *>(scope.scanLine(yy));
+                QColor old = QColor::fromRgba(line[x]);
+                line[x] = qRgba(std::min(255, old.red() + 42), std::min(255, old.green() + 55),
+                                std::min(255, old.blue() + 42), 200);
+            }
+        }
+        p.drawImage(scopeRect.topLeft(), scope);
+    }
+};
+
+static QWidget *scope_card(ProGradeFilter *f, const QString &title, ScopeMode mode)
+{
+    QWidget *box = new QWidget;
+    QVBoxLayout *layout = new QVBoxLayout(box);
+    layout->setContentsMargins(4, 4, 4, 4);
+    QLabel *label = new QLabel(title);
+    label->setAlignment(Qt::AlignCenter);
+    label->setStyleSheet("font-weight:700;font-size:10px;color:#aeb0b7;letter-spacing:0.5px;");
+    layout->addWidget(label);
+    layout->addWidget(new ScopeWidget(f, mode), 1);
+    return box;
+}
+
 static QWidget *wheel_block(ProGradeFilter *f, const QString &title, const char *colorKey,
                             const char *lumaKey, QColor ProGradeFilter::*colorMember,
                             double ProGradeFilter::*lumaMember)
 {
     QWidget *box = new QWidget;
     QVBoxLayout *layout = new QVBoxLayout(box);
-    layout->setContentsMargins(6, 6, 6, 6);
+    layout->setContentsMargins(5, 5, 5, 5);
 
     QLabel *label = new QLabel(title);
     label->setAlignment(Qt::AlignCenter);
@@ -437,7 +738,7 @@ static QWidget *wheel_block(ProGradeFilter *f, const QString &title, const char 
     value->setRange(-1.0, 1.0);
     value->setSingleStep(0.01);
     value->setButtonSymbols(QAbstractSpinBox::NoButtons);
-    value->setMaximumWidth(70);
+    value->setMaximumWidth(65);
     value->setValue(slider->value() / 100.0);
 
     QObject::connect(slider, &QSlider::valueChanged, [f, lumaMember, value](int raw) {
@@ -480,8 +781,7 @@ static QWidget *wheel_block(ProGradeFilter *f, const QString &title, const char 
 }
 
 static QWidget *effect_slider(ProGradeFilter *f, const QString &labelText, const char *key,
-                              double ProGradeFilter::*member, int minValue, int maxValue,
-                              double scale)
+                              double ProGradeFilter::*member, int minValue, int maxValue, double scale)
 {
     QWidget *box = new QWidget;
     QHBoxLayout *row = new QHBoxLayout(box);
@@ -577,7 +877,6 @@ static QWidget *lut_block(ProGradeFilter *f, const QString &title, const char *p
     QHBoxLayout *mixRow = new QHBoxLayout;
     mixRow->addWidget(new QLabel("Mix"));
     mixRow->addWidget(mix, 1);
-
     layout->addWidget(label);
     layout->addLayout(fileRow);
     layout->addLayout(mixRow);
@@ -589,11 +888,12 @@ static void show_panel(ProGradeFilter *f)
     if (!f)
         return;
     ensure_aux_filters(f);
+    f->scopesEnabled.store(true, std::memory_order_relaxed);
 
     QWidget *parent = static_cast<QWidget *>(obs_frontend_get_main_window());
     QDialog dialog(parent);
-    dialog.setWindowTitle("ProGrade Color 0.2");
-    dialog.resize(1080, 760);
+    dialog.setWindowTitle("ProGrade Color 0.3");
+    dialog.resize(1160, 850);
     dialog.setStyleSheet(
         "QDialog{background:#18191c;color:#eeeeef;}"
         "QWidget{color:#eeeeef;}"
@@ -611,7 +911,7 @@ static void show_panel(ProGradeFilter *f)
     QHBoxLayout *header = new QHBoxLayout;
     QLabel *title = new QLabel("PROGRADE");
     title->setStyleSheet("font-weight:800;font-size:18px;letter-spacing:1px;");
-    QLabel *live = new QLabel("● REALTIME GPU");
+    QLabel *live = new QLabel("● LIGHTWEIGHT REALTIME");
     live->setStyleSheet("color:#9da0a8;font-size:11px;");
     header->addWidget(title);
     header->addStretch();
@@ -619,47 +919,57 @@ static void show_panel(ProGradeFilter *f)
     root->addLayout(header);
 
     QTabWidget *tabs = new QTabWidget;
-
     QWidget *primaries = new QWidget;
     QVBoxLayout *primLayout = new QVBoxLayout(primaries);
+
+    QHBoxLayout *scopeRow = new QHBoxLayout;
+    scopeRow->setSpacing(6);
+    scopeRow->addWidget(scope_card(f, "SOURCE PREVIEW", ScopeMode::Preview), 3);
+    scopeRow->addWidget(scope_card(f, "RGB WAVEFORM", ScopeMode::Waveform), 5);
+    scopeRow->addWidget(scope_card(f, "VECTORSCOPE", ScopeMode::Vectorscope), 3);
+    primLayout->addLayout(scopeRow, 1);
+
     QGridLayout *grid = new QGridLayout;
-    grid->setHorizontalSpacing(4);
+    grid->setHorizontalSpacing(3);
     grid->addWidget(wheel_block(f, "LIFT", "lift_color", "lift_luma", &ProGradeFilter::lift,
-                                &ProGradeFilter::liftLuma), 0, 0);
+                                &ProGradeFilter::liftLuma),
+                    0, 0);
     grid->addWidget(wheel_block(f, "GAMMA", "gamma_color", "gamma_luma", &ProGradeFilter::gamma,
-                                &ProGradeFilter::gammaLuma), 0, 1);
+                                &ProGradeFilter::gammaLuma),
+                    0, 1);
     grid->addWidget(wheel_block(f, "GAIN", "gain_color", "gain_luma", &ProGradeFilter::gain,
-                                &ProGradeFilter::gainLuma), 0, 2);
+                                &ProGradeFilter::gainLuma),
+                    0, 2);
     grid->addWidget(wheel_block(f, "OFFSET", "offset_color", "offset_luma", &ProGradeFilter::offset,
-                                &ProGradeFilter::offsetLuma), 0, 3);
-    primLayout->addLayout(grid);
-    primLayout->addWidget(effect_slider(f, "Saturation", "saturation", &ProGradeFilter::saturation,
-                                         0, 200, 100.0));
-    primLayout->addStretch();
-    tabs->addTab(primaries, "Primaries");
+                                &ProGradeFilter::offsetLuma),
+                    0, 3);
+    primLayout->addLayout(grid, 2);
+    primLayout->addWidget(
+        effect_slider(f, "Saturation", "saturation", &ProGradeFilter::saturation, 0, 200, 100.0));
+    tabs->addTab(primaries, "Primaries + Scopes");
 
     QWidget *film = new QWidget;
     QVBoxLayout *filmLayout = new QVBoxLayout(film);
     QLabel *bloomTitle = new QLabel("BLOOM");
     bloomTitle->setStyleSheet("font-weight:800;font-size:13px;");
     filmLayout->addWidget(bloomTitle);
-    filmLayout->addWidget(effect_slider(f, "Strength", "bloom_strength", &ProGradeFilter::bloomStrength,
-                                        0, 100, 100.0));
+    filmLayout->addWidget(
+        effect_slider(f, "Strength", "bloom_strength", &ProGradeFilter::bloomStrength, 0, 100, 100.0));
     filmLayout->addWidget(effect_slider(f, "Threshold", "bloom_threshold", &ProGradeFilter::bloomThreshold,
                                         0, 100, 100.0));
-    filmLayout->addWidget(effect_slider(f, "Radius", "bloom_radius", &ProGradeFilter::bloomRadius,
-                                        0, 300, 10.0));
+    filmLayout->addWidget(
+        effect_slider(f, "Radius", "bloom_radius", &ProGradeFilter::bloomRadius, 0, 300, 10.0));
     QLabel *halTitle = new QLabel("HALATION");
     halTitle->setStyleSheet("font-weight:800;font-size:13px;margin-top:12px;");
     filmLayout->addWidget(halTitle);
-    filmLayout->addWidget(effect_slider(f, "Strength", "halation_strength",
-                                        &ProGradeFilter::halationStrength, 0, 100, 100.0));
-    filmLayout->addWidget(effect_slider(f, "Threshold", "halation_threshold",
-                                        &ProGradeFilter::halationThreshold, 0, 100, 100.0));
-    filmLayout->addWidget(effect_slider(f, "Radius", "halation_radius", &ProGradeFilter::halationRadius,
-                                        0, 200, 10.0));
+    filmLayout->addWidget(effect_slider(f, "Strength", "halation_strength", &ProGradeFilter::halationStrength,
+                                        0, 100, 100.0));
+    filmLayout->addWidget(effect_slider(f, "Threshold", "halation_threshold", &ProGradeFilter::halationThreshold,
+                                        0, 100, 100.0));
+    filmLayout->addWidget(
+        effect_slider(f, "Radius", "halation_radius", &ProGradeFilter::halationRadius, 0, 200, 10.0));
     QLabel *filmInfo = new QLabel(
-        "Bloom softens bright highlights. Halation diffuses highlight energy primarily into the red channel.");
+        "Fast 5-tap GPU blur. At zero strength both effects are bypassed entirely by the shader.");
     filmInfo->setWordWrap(true);
     filmInfo->setStyleSheet("color:#9b9ca2;margin-top:12px;");
     filmLayout->addWidget(filmInfo);
@@ -674,7 +984,7 @@ static void show_panel(ProGradeFilter *f)
     pipeLayout->addWidget(lut_block(f, "CST / CAMERA → REC.709", "cst_path", "cst_mix",
                                     &ProGradeFilter::cstPath, &ProGradeFilter::cstMix));
     QLabel *cstInfo = new QLabel(
-        "Use this slot only for a technical camera transform, for example S-Log3/S-Gamut3.Cine → Rec.709 or C-Log3 → Rec.709. Creative looks stay below.");
+        "Technical camera transform only. Creative looks remain in the two slots below.");
     cstInfo->setWordWrap(true);
     cstInfo->setStyleSheet("color:#9b9ca2;padding:0 8px 8px 8px;");
     pipeLayout->addWidget(cstInfo);
@@ -684,20 +994,6 @@ static void show_panel(ProGradeFilter *f)
                                     &ProGradeFilter::lut2Path, &ProGradeFilter::lut2Mix));
     pipeLayout->addStretch();
     tabs->addTab(pipeline, "CST & LUTs");
-
-    QWidget *scopes = new QWidget;
-    QVBoxLayout *scopeLayout = new QVBoxLayout(scopes);
-    QLabel *scopeTitle = new QLabel("SCOPES / PREVIEW ENGINE");
-    scopeTitle->setStyleSheet("font-weight:800;font-size:14px;");
-    QLabel *scopeInfo = new QLabel(
-        "Reserved for the next build: embedded source preview, RGB waveform and vectorscope. The grading engine is already separated so scopes can update at a lower rate without slowing the 60 fps video path.");
-    scopeInfo->setWordWrap(true);
-    scopeInfo->setStyleSheet("color:#a5a6ac;");
-    scopeLayout->addWidget(scopeTitle);
-    scopeLayout->addWidget(scopeInfo);
-    scopeLayout->addStretch();
-    tabs->addTab(scopes, "Scopes");
-
     root->addWidget(tabs, 1);
 
     QHBoxLayout *buttons = new QHBoxLayout;
@@ -722,12 +1018,14 @@ static void show_panel(ProGradeFilter *f)
         obs_source_update(f->context, settings);
         obs_data_release(settings);
         dialog.accept();
+        f->scopesEnabled.store(false, std::memory_order_relaxed);
         show_panel(f);
     });
     QObject::connect(close, &QPushButton::clicked, &dialog, &QDialog::accept);
     root->addLayout(buttons);
 
     dialog.exec();
+    f->scopesEnabled.store(false, std::memory_order_relaxed);
 }
 
 static const char *filter_name(void *)
@@ -806,7 +1104,7 @@ static obs_properties_t *filter_properties(void *)
 {
     obs_properties_t *props = obs_properties_create();
     obs_properties_add_text(props, "info",
-                            "ProGrade 0.2: realtime GPU primaries, technical CST, bloom, halation and dual creative LUTs.",
+                            "ProGrade 0.3: cached wheels, lightweight embedded scopes, GPU primaries, CST, bloom, halation and dual LUTs.",
                             OBS_TEXT_INFO);
     obs_properties_add_button(props, "open_panel", "Open ProGrade Color", open_panel_button);
     return props;
@@ -816,6 +1114,7 @@ static void *filter_create(obs_data_t *settings, obs_source_t *context)
 {
     auto *f = new ProGradeFilter;
     f->context = context;
+    f->scopePixels.reserve(static_cast<size_t>(SCOPE_W) * SCOPE_H);
 
     obs_enter_graphics();
     f->effect = gs_effect_create(effect_text, "prograde.effect", nullptr);
@@ -864,6 +1163,7 @@ static void filter_destroy(void *data)
     if (!f)
         return;
 
+    f->scopesEnabled.store(false, std::memory_order_relaxed);
     release_aux_filter(f->parent, f->cst);
     release_aux_filter(f->parent, f->lut1);
     release_aux_filter(f->parent, f->lut2);
@@ -908,6 +1208,12 @@ static void filter_render(void *data, gs_effect_t *)
         if (f)
             obs_source_skip_video_filter(f->context);
         return;
+    }
+
+    if (f->scopesEnabled.load(std::memory_order_relaxed)) {
+        ++f->scopeFrameCounter;
+        if ((f->scopeFrameCounter & 7u) == 0u)
+            capture_scope_frame(f);
     }
 
     if (!obs_source_process_filter_begin(f->context, GS_RGBA, OBS_NO_DIRECT_RENDERING))
@@ -990,6 +1296,6 @@ bool obs_module_load(void)
     info.filter_add = filter_add;
     info.filter_remove = filter_remove;
     obs_register_source(&info);
-    blog(LOG_INFO, "[ProGrade] 0.2 loaded: realtime primaries, CST, bloom, halation, dual LUT");
+    blog(LOG_INFO, "[ProGrade] 0.3 loaded: cached wheels, embedded scopes, optimized GPU effects");
     return true;
 }
