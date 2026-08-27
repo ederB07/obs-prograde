@@ -11,14 +11,9 @@ include(helpers)
 add_library(${CMAKE_PROJECT_NAME} MODULE)
 
 find_package(libobs REQUIRED)
-find_package(obs-frontend-api REQUIRED)
-find_package(Qt6 REQUIRED COMPONENTS Widgets Core Gui)
 
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs OBS::obs-frontend-api Qt6::Core Qt6::Gui Qt6::Widgets)
-
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.cpp)
-
 target_compile_features(${CMAKE_PROJECT_NAME} PRIVATE cxx_std_17)
-set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
